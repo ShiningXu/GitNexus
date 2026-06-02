@@ -119,7 +119,7 @@ export function processJavaHttpConsumerRoutes(
       targetId: routeNodeId,
       type: 'FETCHES',
       confidence: 0.7,
-      reason: `java-http-consumer|method:${call.httpMethod}|framework:${call.framework}|url:${call.rawUrl}`,
+      reason: `java-http-consumer|method:${call.httpMethod}|framework:${call.framework}|url:${call.routePath}`,
     });
   }
 }

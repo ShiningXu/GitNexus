@@ -61,5 +61,7 @@ describe('Java HTTP consumer graph edges', () => {
         reason: expect.stringContaining('java-http-consumer|method:GET'),
       }),
     ]);
+    expect(fetchEdges[0].reason).toContain('url:/flow-api/flow/query');
+    expect(fetchEdges[0].reason).not.toContain('vip-operation-flow-online');
   });
 });
