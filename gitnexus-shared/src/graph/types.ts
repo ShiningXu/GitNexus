@@ -112,6 +112,8 @@ export type RelationshipType =
   | 'STEP_IN_PROCESS'
   | 'HANDLES_ROUTE'
   | 'FETCHES'
+  | 'CONSUMES_TOPIC'
+  | 'PRODUCES_TOPIC'
   | 'HANDLES_TOOL'
   | 'ENTRY_POINT_OF'
   | 'WRAPS'

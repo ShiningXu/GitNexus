@@ -29,6 +29,16 @@ import {
   compiledMatcherMatchesRoute,
 } from '../route-extractors/middleware.js';
 import { processNextjsFetchRoutes } from '../call-processor.js';
+import {
+  extractJavaHttpConsumerCalls,
+  processJavaHttpConsumerRoutes,
+} from '../route-extractors/java-http-consumers.js';
+import {
+  extractJavaRocketMqBeanProperties,
+  extractJavaRocketMqConfig,
+  extractJavaRocketMqConsumerEdges,
+  processJavaRocketMqConsumerEdges,
+} from '../route-extractors/java-rocketmq-consumers.js';
 import { generateId } from '../../../lib/utils.js';
 import { readFileContents } from '../filesystem-walker.js';
 import { isDev } from '../utils/env.js';
@@ -403,6 +413,49 @@ export const routesPhase: PipelinePhase<RoutesOutput> = {
         logger.info(
           `🔗 Processed ${allFetchCalls.length} fetch() calls against ${routeRegistry.size} routes`,
         );
+      }
+    }
+
+    // ── Java HTTP consumer extraction ──
+    // Minimal Spring/Java client support for repos where the important edge is
+    // an outbound RestTemplate/FastHttpClient call and no matching in-repo
+    // provider route exists. Provider-side Spring support remains in the group
+    // contract extractor; this pass only materializes consumer Route/FETCHES
+    // graph edges during `gitnexus analyze`.
+    const javaPaths = allPaths.filter((p) => p.endsWith('.java'));
+    if (javaPaths.length > 0) {
+      const javaContents = await readFileContents(ctx.repoPath, javaPaths);
+      const javaHttpCalls = [...javaContents].flatMap(([filePath, content]) =>
+        extractJavaHttpConsumerCalls(filePath, content),
+      );
+      if (javaHttpCalls.length > 0) {
+        processJavaHttpConsumerRoutes(ctx.graph, javaHttpCalls);
+        if (isDev) {
+          logger.info(`🔗 Processed ${javaHttpCalls.length} Java HTTP consumer calls`);
+        }
+      }
+
+      // ── Java RocketMQ consumer extraction ──
+      // Minimal Java-only consumer support for Spring RocketMQ annotations and
+      // DefaultMQPushConsumer.subscribe(...) patterns. Topic/group placeholders
+      // are resolved from common Spring properties/YAML files in this repo.
+      const configPaths = allPaths.filter((p) => /\.(?:properties|ya?ml)$/i.test(p));
+      const configContents = await readFileContents(ctx.repoPath, configPaths);
+      const rocketMqConfig = extractJavaRocketMqConfig(
+        [...configContents].map(([filePath, content]) => ({ filePath, content })),
+      );
+      const rocketMqBeanProperties = extractJavaRocketMqBeanProperties(
+        [...javaContents].map(([filePath, content]) => ({ filePath, content })),
+        rocketMqConfig,
+      );
+      const rocketMqEdges = [...javaContents].flatMap(([filePath, content]) =>
+        extractJavaRocketMqConsumerEdges(filePath, content, rocketMqConfig, rocketMqBeanProperties),
+      );
+      if (rocketMqEdges.length > 0) {
+        processJavaRocketMqConsumerEdges(ctx.graph, rocketMqEdges);
+        if (isDev) {
+          logger.info(`🔗 Processed ${rocketMqEdges.length} Java RocketMQ consumer edges`);
+        }
       }
     }
 
