@@ -217,6 +217,9 @@ function resolveUrlExpression(
   expr: string,
   bindings: ReadonlyMap<string, readonly string[]>,
 ): string[] {
+  const concatenated = resolveConcatenatedUrlExpression(expr, bindings);
+  if (concatenated.length > 0) return concatenated;
+
   const out: string[] = [];
   const add = (values: readonly string[]) => {
     for (const value of values) if (!out.includes(value)) out.push(value);
@@ -230,6 +233,94 @@ function resolveUrlExpression(
   }
 
   return out;
+}
+
+function resolveConcatenatedUrlExpression(
+  expr: string,
+  bindings: ReadonlyMap<string, readonly string[]>,
+): string[] {
+  const parts = splitTopLevelPlus(expr);
+  if (parts.length <= 1) return [];
+
+  let combined = [''];
+  for (const part of parts) {
+    const values = resolveUrlPart(part, bindings);
+    if (values.length === 0) return [];
+    const next: string[] = [];
+    for (const prefix of combined) {
+      for (const value of values) {
+        const joined = `${prefix}${value}`;
+        if (!next.includes(joined)) next.push(joined);
+      }
+    }
+    combined = next;
+  }
+
+  return combined.filter((value) => URL_LIKE_RE.test(value));
+}
+
+function resolveUrlPart(
+  rawPart: string,
+  bindings: ReadonlyMap<string, readonly string[]>,
+): string[] {
+  const part = stripWrappingParens(rawPart.trim());
+  if (!part) return [];
+
+  const literal = firstStringLiteral(part);
+  if (literal !== null) return [literal];
+
+  if (/^[A-Za-z_$][\w$]*$/.test(part)) return [...(bindings.get(part) ?? [])];
+
+  const out: string[] = [];
+  for (const id of part.match(/\b[A-Za-z_$][\w$]*\b/g) ?? []) {
+    for (const value of bindings.get(id) ?? []) {
+      if (!out.includes(value)) out.push(value);
+    }
+  }
+  return out;
+}
+
+function splitTopLevelPlus(expr: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  let quote: '"' | "'" | '`' | null = null;
+  for (let i = 0; i < expr.length; i++) {
+    const ch = expr[i]!;
+    const prev = expr[i - 1];
+    if (quote) {
+      if (ch === quote && prev !== '\\') quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      quote = ch;
+      continue;
+    }
+    if (ch === '(' || ch === '[' || ch === '{') {
+      depth++;
+      continue;
+    }
+    if (ch === ')' || ch === ']' || ch === '}') {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (ch === '+' && depth === 0) {
+      parts.push(expr.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  parts.push(expr.slice(start).trim());
+  return parts;
+}
+
+function stripWrappingParens(value: string): string {
+  let s = value.trim();
+  while (s.startsWith('(') && s.endsWith(')')) {
+    const inner = s.slice(1, -1).trim();
+    if (!inner) break;
+    s = inner;
+  }
+  return s;
 }
 
 function inferHttpMethod(methodName: string): string | null {

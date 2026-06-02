@@ -390,4 +390,34 @@ describe('HttpRouteExtractor — graph-assisted multi-verb disambiguation', () =
     expect(out[0].meta.method).toBe('GET'); // conservative default
     expect(out[0].contractId).toBe('http::GET::/api/orders');
   });
+
+  it('consumer: fetchReason method wins when graph edge carries Java HTTP method', async () => {
+    FILE_DETECTIONS.set('client.ts', [
+      detection('consumer', 'GET', '/api/orders', null),
+      detection('consumer', 'POST', '/api/orders', null),
+    ]);
+
+    const db = vi.fn(async (query: string) => {
+      if (query.includes('FETCHES')) {
+        return [
+          {
+            fileId: 'f1',
+            filePath: 'client.ts',
+            routePath: '/api/orders',
+            fetchReason:
+              'java-http-consumer|method:POST|framework:spring-rest-template|url:/api/orders',
+          },
+        ];
+      }
+      return [];
+    });
+
+    const out = await new HttpRouteExtractor().extract(db, '/repo', {
+      name: 'r',
+      url: 'r',
+    } as never);
+    expect(out).toHaveLength(1);
+    expect(out[0].meta.method).toBe('POST');
+    expect(out[0].contractId).toBe('http::POST::/api/orders');
+  });
 });

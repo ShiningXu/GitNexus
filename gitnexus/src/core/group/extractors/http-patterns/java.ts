@@ -66,28 +66,26 @@ interface SpringTypeInfo {
   filePath: string;
   kind: 'class' | 'interface';
   name: string;
-  classPrefix: string;
+  classPrefixes: string[];
   implementedInterfaces: string[];
   isController: boolean;
   methods: SpringMethodInfo[];
 }
 
 // ─── Route-defining annotations (one generic query, one pass) ─────────
-// Every Java route-mapper annotation shares one shape: an annotation carrying a
-// single string argument — positional `"..."` or named `key = "..."` — on a
-// class, interface, or method. This SINGLE query matches that shape generically;
+// Every Java route-mapper annotation shares one shape: an annotation carrying
+// string route arguments — positional `"..."`, array `{"/a","/b"}`, or named
+// `key = ...` — on a class, interface, or method. This SINGLE query matches
+// those shapes generically;
 // `scanRouteAnnotations` then reads the annotation NAME (`@ann`) and declaration
 // kind (`@node.type`) in its for-loop to decide what each match means. Adding a
 // new framework annotation that follows this single-string-argument shape is a
-// change to that loop (and the lookup maps), not to this query. Annotations with
-// a different argument shape — e.g. an array value `@RequestMapping({"/a","/b"})`
-// — are out of scope here (as they were for the prior queries) and would need a
-// new branch.
+// change to that loop (and the lookup maps), not to this query.
 //
 // Captures (shared across all branches; intentionally framework-agnostic):
 //   @ann    → the annotation name identifier (RequestMapping, GetMapping, RequestLine, …)
 //   @node   → the enclosing declaration (class_declaration | interface_declaration | method_declaration)
-//   @value  → the string-literal argument
+//   @value  → one string-literal route value; array annotations yield one match per value
 //   @key    → the named-argument member key (absent for the positional shape)
 //   @member → the method name (method_declaration branches only)
 //
@@ -111,11 +109,23 @@ const JAVA_ROUTE_ANNOTATION_PATTERNS = compilePatterns({
               (annotation
                 name: (identifier) @ann
                 arguments: (annotation_argument_list (string_literal) @value)))) @node
+          (class_declaration
+            (modifiers
+              (annotation
+                name: (identifier) @ann
+                arguments: (annotation_argument_list
+                  (element_value_array_initializer (string_literal) @value))))) @node
           (interface_declaration
             (modifiers
               (annotation
                 name: (identifier) @ann
                 arguments: (annotation_argument_list (string_literal) @value)))) @node
+          (interface_declaration
+            (modifiers
+              (annotation
+                name: (identifier) @ann
+                arguments: (annotation_argument_list
+                  (element_value_array_initializer (string_literal) @value))))) @node
           (class_declaration
             (modifiers
               (annotation
@@ -124,6 +134,14 @@ const JAVA_ROUTE_ANNOTATION_PATTERNS = compilePatterns({
                   (element_value_pair
                     key: (identifier) @key
                     value: (string_literal) @value))))) @node
+          (class_declaration
+            (modifiers
+              (annotation
+                name: (identifier) @ann
+                arguments: (annotation_argument_list
+                  (element_value_pair
+                    key: (identifier) @key
+                    value: (element_value_array_initializer (string_literal) @value)))))) @node
           (interface_declaration
             (modifiers
               (annotation
@@ -132,6 +150,14 @@ const JAVA_ROUTE_ANNOTATION_PATTERNS = compilePatterns({
                   (element_value_pair
                     key: (identifier) @key
                     value: (string_literal) @value))))) @node
+          (interface_declaration
+            (modifiers
+              (annotation
+                name: (identifier) @ann
+                arguments: (annotation_argument_list
+                  (element_value_pair
+                    key: (identifier) @key
+                    value: (element_value_array_initializer (string_literal) @value)))))) @node
           (method_declaration
             (modifiers
               (annotation
@@ -143,9 +169,25 @@ const JAVA_ROUTE_ANNOTATION_PATTERNS = compilePatterns({
               (annotation
                 name: (identifier) @ann
                 arguments: (annotation_argument_list
+                  (element_value_array_initializer (string_literal) @value))))
+            name: (identifier) @member) @node
+          (method_declaration
+            (modifiers
+              (annotation
+                name: (identifier) @ann
+                arguments: (annotation_argument_list
                   (element_value_pair
                     key: (identifier) @key
                     value: (string_literal) @value))))
+            name: (identifier) @member) @node
+          (method_declaration
+            (modifiers
+              (annotation
+                name: (identifier) @ann
+                arguments: (annotation_argument_list
+                  (element_value_pair
+                    key: (identifier) @key
+                    value: (element_value_array_initializer (string_literal) @value)))))
             name: (identifier) @member) @node
         ]
       `,
@@ -445,10 +487,10 @@ interface RequestLineAnnotation {
 }
 
 interface RouteAnnotationScan {
-  /** Spring `@RequestMapping` URL prefix per class/interface node id (last write wins). */
-  prefixByTypeId: Map<number, string>;
-  /** OpenFeign interface prefix per interface node id; `@FeignClient(path)` wins over `@RequestMapping`. */
-  feignPrefixByInterfaceId: Map<number, string>;
+  /** Spring `@RequestMapping` URL prefixes per class/interface node id. */
+  prefixByTypeId: Map<number, string[]>;
+  /** OpenFeign interface prefixes; `@FeignClient(path)` wins over `@RequestMapping`. */
+  feignPrefixByInterfaceId: Map<number, string[]>;
   /** One entry per resolved Spring `@(Get|...)Mapping` route — a method with N mappings yields N entries. */
   methodRoutes: MethodRouteAnnotation[];
   /** One entry per OpenFeign `@RequestLine` whose value parses to a verb + path. */
@@ -473,13 +515,18 @@ function scanRouteAnnotations(tree: Parser.Tree): RouteAnnotationScan {
   // collectSpringTypes cross-file inheritance), while `feignPrefixByInterfaceId`
   // feeds the OpenFeign *consumer* path in scan(). An interface carrying both
   // `@RequestMapping` and `@FeignClient(path)` lands a different value in each.
-  const prefixByTypeId = new Map<number, string>();
-  const feignPrefixByInterfaceId = new Map<number, string>();
+  const prefixByTypeId = new Map<number, string[]>();
+  const feignPrefixByInterfaceId = new Map<number, string[]>();
   const methodRoutes: MethodRouteAnnotation[] = [];
   const requestLines: RequestLineAnnotation[] = [];
   // Interface `@RequestMapping` prefixes rank below `@FeignClient(path)`;
   // collect them and apply only after the FeignClient pass below.
   const interfaceRequestMappingPrefixes: Array<{ id: number; prefix: string }> = [];
+  const addPrefix = (map: Map<number, string[]>, id: number, prefix: string): void => {
+    const prefixes = map.get(id) ?? [];
+    if (!prefixes.includes(prefix)) prefixes.push(prefix);
+    map.set(id, prefixes);
+  };
 
   for (const { captures } of matches) {
     const annNode = captures.ann;
@@ -525,7 +572,7 @@ function scanRouteAnnotations(tree: Parser.Tree): RouteAnnotationScan {
       if (!isRouteMemberKey(keyNode)) continue;
       const prefix = unquoteLiteral(valueNode.text);
       if (prefix !== null) {
-        prefixByTypeId.set(node.id, prefix);
+        addPrefix(prefixByTypeId, node.id, prefix);
         if (node.type === 'interface_declaration') {
           interfaceRequestMappingPrefixes.push({ id: node.id, prefix });
         }
@@ -535,13 +582,13 @@ function scanRouteAnnotations(tree: Parser.Tree): RouteAnnotationScan {
       if (!keyNode || keyNode.text !== 'path') continue;
       const prefix = unquoteLiteral(valueNode.text);
       if (prefix !== null && !feignPrefixByInterfaceId.has(node.id)) {
-        feignPrefixByInterfaceId.set(node.id, prefix);
+        feignPrefixByInterfaceId.set(node.id, [prefix]);
       }
     }
   }
 
   for (const { id, prefix } of interfaceRequestMappingPrefixes) {
-    if (!feignPrefixByInterfaceId.has(id)) feignPrefixByInterfaceId.set(id, prefix);
+    if (!feignPrefixByInterfaceId.has(id)) addPrefix(feignPrefixByInterfaceId, id, prefix);
   }
 
   return { prefixByTypeId, feignPrefixByInterfaceId, methodRoutes, requestLines };
@@ -609,7 +656,7 @@ function collectSpringTypes(filePath: string, tree: Parser.Tree): SpringTypeInfo
       filePath,
       kind,
       name: typeNameNode.text,
-      classPrefix: prefixByTypeId.get(typeNode.id) ?? '',
+      classPrefixes: prefixByTypeId.get(typeNode.id) ?? [''],
       implementedInterfaces: kind === 'class' ? collectImplementedInterfaces(typeNode) : [],
       isController: kind === 'class' && hasAnnotation(typeNode, ['RestController', 'Controller']),
       methods,
@@ -631,10 +678,12 @@ function scanSpringProject(files: readonly HttpScanInput[]): HttpFileDetections[
     }
     const methodMap = new Map<string, SpringRouteBinding[]>();
     for (const method of type.methods) {
-      const routes = method.routes.map((route) => ({
-        method: route.method,
-        path: type.classPrefix ? joinPath(type.classPrefix, route.path) : route.path,
-      }));
+      const routes = method.routes.flatMap((route) =>
+        type.classPrefixes.map((prefix) => ({
+          method: route.method,
+          path: prefix ? joinPath(prefix, route.path) : route.path,
+        })),
+      );
       if (routes.length > 0) methodMap.set(method.name, routes);
     }
     interfaceRoutes.set(type.name, methodMap);
@@ -649,10 +698,12 @@ function scanSpringProject(files: readonly HttpScanInput[]): HttpFileDetections[
         const routeMap = interfaceRoutes.get(interfaceName);
         if (!routeMap) return [];
         const routes = routeMap.get(method.name) ?? [];
-        return routes.map((route) => ({
-          method: route.method,
-          path: joinPath(type.classPrefix, route.path),
-        }));
+        return routes.flatMap((route) =>
+          type.classPrefixes.map((prefix) => ({
+            method: route.method,
+            path: joinPath(prefix, route.path),
+          })),
+        );
       });
 
       for (const route of inheritedRoutes) {
@@ -697,28 +748,32 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
     for (const route of methodRoutes) {
       const enclosingInterface = findEnclosingInterface(route.methodNode);
       if (enclosingInterface && hasAnnotation(enclosingInterface, 'FeignClient')) {
-        const prefix = feignPrefixByInterfaceId.get(enclosingInterface.id) ?? '';
-        out.push({
-          role: 'consumer',
-          framework: 'openfeign',
-          method: route.httpMethod,
-          path: joinPath(prefix, route.rawPath),
-          name: route.methodName,
-          confidence: 0.7,
-        });
+        const prefixes = feignPrefixByInterfaceId.get(enclosingInterface.id) ?? [''];
+        for (const prefix of prefixes) {
+          out.push({
+            role: 'consumer',
+            framework: 'openfeign',
+            method: route.httpMethod,
+            path: joinPath(prefix, route.rawPath),
+            name: route.methodName,
+            confidence: 0.7,
+          });
+        }
         continue;
       }
       const enclosingClass = findEnclosingClass(route.methodNode);
       if (!enclosingClass) continue;
-      const prefix = prefixByTypeId.get(enclosingClass.id) ?? '';
-      out.push({
-        role: 'provider',
-        framework: 'spring',
-        method: route.httpMethod,
-        path: joinPath(prefix, route.rawPath),
-        name: route.methodName,
-        confidence: 0.8,
-      });
+      const prefixes = prefixByTypeId.get(enclosingClass.id) ?? [''];
+      for (const prefix of prefixes) {
+        out.push({
+          role: 'provider',
+          framework: 'spring',
+          method: route.httpMethod,
+          path: joinPath(prefix, route.rawPath),
+          name: route.methodName,
+          confidence: 0.8,
+        });
+      }
     }
 
     // Native OpenFeign `@RequestLine("METHOD /path")`. Method-level only and
@@ -734,15 +789,17 @@ export const JAVA_HTTP_PLUGIN: HttpLanguagePlugin = {
     for (const requestLine of requestLines) {
       const enclosingInterface = findEnclosingInterface(requestLine.methodNode);
       if (!enclosingInterface) continue;
-      const prefix = feignPrefixByInterfaceId.get(enclosingInterface.id) ?? '';
-      out.push({
-        role: 'consumer',
-        framework: 'openfeign',
-        method: requestLine.parsed.method,
-        path: joinPath(prefix, requestLine.parsed.path),
-        name: requestLine.methodName,
-        confidence: 0.75,
-      });
+      const prefixes = feignPrefixByInterfaceId.get(enclosingInterface.id) ?? [''];
+      for (const prefix of prefixes) {
+        out.push({
+          role: 'consumer',
+          framework: 'openfeign',
+          method: requestLine.parsed.method,
+          path: joinPath(prefix, requestLine.parsed.path),
+          name: requestLine.methodName,
+          confidence: 0.75,
+        });
+      }
     }
 
     // ─── Consumers: RestTemplate ────────────────────────────────────

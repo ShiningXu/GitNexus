@@ -283,6 +283,37 @@ public class OrderController {
       expect(route).toBeDefined();
     });
 
+    it('extracts Spring class-level @RequestMapping array prefixes', async () => {
+      const dir = path.join(tmpDir, 'spring-class-array-prefixes');
+      fs.mkdirSync(path.join(dir, 'src/controller'), { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, 'src/controller/SkuController.java'),
+        `
+package com.example;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping({"/vip-commodity/sku", "/vip-commodity-admin/sku"})
+public class SkuController {
+    @PostMapping("generateSkuId")
+    public String generateSkuId() { return ""; }
+}
+`,
+      );
+
+      const contracts = await extractor.extract(null, dir, makeRepo(dir));
+      const providers = contracts.filter((c) => c.role === 'provider');
+
+      expect(
+        providers.find((c) => c.contractId === 'http::POST::/vip-commodity/sku/generateskuid'),
+      ).toBeDefined();
+      expect(
+        providers.find(
+          (c) => c.contractId === 'http::POST::/vip-commodity-admin/sku/generateskuid',
+        ),
+      ).toBeDefined();
+    });
+
     it('extracts Spring method-level @GetMapping(value = "/users") (named value)', async () => {
       const dir = path.join(tmpDir, 'spring-method-named-value');
       fs.mkdirSync(path.join(dir, 'src/controller'), { recursive: true });

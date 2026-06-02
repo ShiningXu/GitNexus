@@ -119,6 +119,11 @@ function methodFromRouteReason(reason: string): string | null {
   return null;
 }
 
+function methodFromFetchReason(reason: string): string | null {
+  const match = /\bmethod:([A-Z]+)\b/.exec(reason || '');
+  return match?.[1] ?? null;
+}
+
 function pickSymbolUid(
   rows: Record<string, unknown>[],
   preferredName: string | null,
@@ -465,7 +470,8 @@ export class HttpRouteExtractor implements ContractExtractor {
       const filePath = String(row.filePath ?? '');
       const routePath = String(row.routePath ?? '');
       const pathNorm = normalizeHttpPath(routePath);
-      let method = 'GET';
+      const reasonMethod = methodFromFetchReason(String(row.fetchReason ?? ''));
+      let method = reasonMethod ?? 'GET';
       // Prefer the plugin's detected method if we can find a matching
       // fetch/axios call in the same file.
       const detections = filePath ? await getDetections(filePath) : [];
@@ -479,7 +485,7 @@ export class HttpRouteExtractor implements ContractExtractor {
       const consumerCandidates = detections.filter(
         (d) => d.role === 'consumer' && normalizeConsumerPath(d.path) === pathNorm,
       );
-      if (consumerCandidates.length === 1) {
+      if (!reasonMethod && consumerCandidates.length === 1) {
         method = consumerCandidates[0].method;
       }
 

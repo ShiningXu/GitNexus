@@ -78,4 +78,52 @@ describe('Java HTTP consumer extraction', () => {
       }),
     ]);
   });
+
+  it('combines bound base URLs with path literals before normalizing routes', () => {
+    const source = `
+      class VccApi {
+        @Value("\${vcc.vip-commodity.eureka.host:http://VIP-COMMODITY-CENTER-ONLINE/vip-commodity}")
+        private String vccEurekaHost;
+        @Value("\${vcc.vip-commodity.eureka.host.qsm:http://vip-commodity-center.qsm.qiyi.middle/vip-commodity}")
+        private String vccEurekaHostQsm;
+
+        void batchQuerySku() {
+          String baseUrl = qsmUtils.getQsmSwitch() ? vccEurekaHostQsm : vccEurekaHost;
+          String url = baseUrl + "/basicAndSku/sku/batchQuery";
+          restTemplateBase.postForObject(url, request, HttpClientResponseDTO.class);
+        }
+      }
+    `;
+
+    const calls = extractJavaHttpConsumerCalls('src/VccApi.java', source);
+    expect(calls.map((c) => c.routePath).sort()).toEqual([
+      '/vip-commodity/basicAndSku/sku/batchQuery',
+      '/vip-commodity/basicAndSku/sku/batchQuery',
+    ]);
+    expect(calls.every((c) => c.httpMethod === 'POST')).toBe(true);
+  });
+
+  it('combines a resolved URL variable with an inline path literal argument', () => {
+    const source = `
+      class VccAdminApi {
+        @Value("\${vcc.admin.api.url:http://VIP-COMMODITY-CENTER-ADMIN-TEST/vip-commodity-admin}")
+        private String vccAdminApiUrl;
+        @Value("\${vcc.admin.api.qsm.url:http://vip-commodity-center-admin.qsm.qiyi.middle/vip-commodity-admin}")
+        private String vccAdminApiQsmUrl;
+
+        void generaterSkuId() {
+          RestTemplate restTemplate = qsmUtils.getQsmSwitch() ? this.longRestTemplate : this.lbLongRestTemplate;
+          String url = qsmUtils.getQsmSwitch() ? this.vccAdminApiQsmUrl : this.vccAdminApiUrl;
+          restTemplate.postForObject(url + "/sku/generateSkuId", entity, HttpClientResponseDTO.class);
+        }
+      }
+    `;
+
+    const calls = extractJavaHttpConsumerCalls('src/VccAdminApi.java', source);
+    expect(calls.map((c) => c.routePath).sort()).toEqual([
+      '/vip-commodity-admin/sku/generateSkuId',
+      '/vip-commodity-admin/sku/generateSkuId',
+    ]);
+    expect(calls.every((c) => c.httpMethod === 'POST')).toBe(true);
+  });
 });
