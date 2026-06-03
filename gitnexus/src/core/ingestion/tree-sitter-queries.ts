@@ -905,6 +905,7 @@ export const GO_QUERIES = `
 ; Functions & Methods
 (function_declaration name: (identifier) @name) @definition.function
 (method_declaration name: (field_identifier) @name) @definition.method
+(method_elem name: (field_identifier) @name) @definition.method
 
 ; Types
 (type_declaration (type_spec name: (type_identifier) @name type: (struct_type))) @definition.struct
@@ -979,6 +980,12 @@ export const CPP_QUERIES = `
   name: (template_type
     (type_identifier) @name
     (template_argument_list) @template-arguments)) @definition.class
+; Out-of-line nested definition: class Outer::Inner { ... } / struct Outer::Inner { ... }.
+; Key the node by the full qualified_identifier text so the def materializes a
+; node that matches the HAS_METHOD owner id (also the full qualified text) and
+; stays distinct from a same-tail type in another scope (#1975, #1978).
+(class_specifier name: (qualified_identifier) @name) @definition.class
+(struct_specifier name: (qualified_identifier) @name) @definition.struct
 (struct_specifier name: (type_identifier) @name) @definition.struct
 (struct_specifier
   name: (template_type
@@ -1208,10 +1215,19 @@ export const RUST_QUERIES = `
 (function_item name: (identifier) @name) @definition.function
 (function_signature_item name: (identifier) @name) @definition.function
 (struct_item name: (type_identifier) @name) @definition.struct
+; A union is materialized as a Struct node (same rationale as the
+; scope-resolution @declaration.struct in languages/rust/query.ts: every
+; registry-primary resolution gate includes Struct but excludes Union, so a
+; Union-labeled node would be an unresolvable orphan). #1934 F71.
+(union_item name: (type_identifier) @name) @definition.struct
 (enum_item name: (type_identifier) @name) @definition.enum
 (trait_item name: (type_identifier) @name) @definition.trait
 (impl_item type: (type_identifier) @name !trait) @definition.impl
 (impl_item type: (generic_type type: (type_identifier) @name) !trait) @definition.impl
+; Scoped inherent impl: impl path::Type { ... }. Key the Impl node by the full
+; scoped_type_identifier text so it matches the owner id (also full text) and
+; stays distinct from a same-tail type in another module (#1975).
+(impl_item type: (scoped_type_identifier) @name !trait) @definition.impl
 (mod_item name: (identifier) @name) @definition.module
 
 ; Type aliases, const, static, macros
@@ -1395,9 +1411,20 @@ export const RUBY_QUERIES = `
 (module
   name: (constant) @name) @definition.module
 
+; Namespaced module: module Baz::Qux (name field is a scope_resolution node).
+; Separate top-level pattern (not a [...] alternation) so neither branch is
+; silently dropped — see #1975. The full scope_resolution text keys the node so
+; it matches the HAS_METHOD owner id derived from the same name field.
+(module
+  name: (scope_resolution) @name) @definition.module
+
 ; ── Classes ──────────────────────────────────────────────────────────────────
 (class
   name: (constant) @name) @definition.class
+
+; Namespaced class: class Foo::Bar (name field is a scope_resolution node).
+(class
+  name: (scope_resolution) @name) @definition.class
 
 ; ── Instance methods ─────────────────────────────────────────────────────────
 (method
