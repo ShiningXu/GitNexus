@@ -1,6 +1,12 @@
 import { glob } from 'glob';
 import Parser from 'tree-sitter';
 import { createIgnoreFilter } from '../../../config/ignore-service.js';
+import {
+  extractJavaRocketMqBeanProperties,
+  extractJavaRocketMqConfig,
+  extractJavaRocketMqConsumerEdges,
+  type JavaRocketMqConfigFile,
+} from '../../ingestion/route-extractors/java-rocketmq-consumers.js';
 import type { ContractExtractor, CypherExecutor } from '../contract-extractor.js';
 import type { ExtractedContract, RepoHandle } from '../types.js';
 import { readSafe } from './fs-utils.js';
@@ -74,11 +80,26 @@ export class TopicExtractor implements ContractExtractor {
       ignore: ignoreFilter,
       nodir: true,
     });
+    const configFiles = await glob('**/*.{properties,yml,yaml}', {
+      cwd: repoPath,
+      ignore: ignoreFilter,
+      nodir: true,
+    });
 
     // One parser reused across files; the scanner calls `setLanguage` per
     // file based on which plugin the registry returns.
     const parser = new Parser();
     const out: ExtractedContract[] = [];
+    const javaRocketMqFiles = this.readFiles(
+      repoPath,
+      files.filter((rel) => rel.endsWith('.java')),
+    );
+    const javaRocketMqConfigFiles = this.readFiles(repoPath, configFiles);
+    const javaRocketMqConfig = extractJavaRocketMqConfig(javaRocketMqConfigFiles);
+    const javaRocketMqBeans = extractJavaRocketMqBeanProperties(
+      javaRocketMqFiles,
+      javaRocketMqConfig,
+    );
 
     for (const rel of files) {
       const provider = getProviderForFile(rel);
@@ -97,7 +118,39 @@ export class TopicExtractor implements ContractExtractor {
       }
     }
 
+    for (const file of javaRocketMqFiles) {
+      const edges = extractJavaRocketMqConsumerEdges(
+        file.filePath,
+        file.content,
+        javaRocketMqConfig,
+        javaRocketMqBeans,
+      );
+      for (const edge of edges) {
+        out.push(
+          makeContract(
+            edge.topicName,
+            {
+              role: edge.role === 'producer' ? 'provider' : 'consumer',
+              broker: 'rocketmq',
+              confidence: edge.rawTopic.startsWith('${') ? 0.75 : 0.85,
+              symbolName: edge.framework,
+            },
+            edge.filePath,
+          ),
+        );
+      }
+    }
+
     return this.dedupe(out);
+  }
+
+  private readFiles(repoPath: string, relPaths: readonly string[]): JavaRocketMqConfigFile[] {
+    const out: JavaRocketMqConfigFile[] = [];
+    for (const rel of relPaths) {
+      const content = readSafe(repoPath, rel);
+      if (content) out.push({ filePath: rel, content });
+    }
+    return out;
   }
 
   private dedupe(items: ExtractedContract[]): ExtractedContract[] {

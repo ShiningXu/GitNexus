@@ -2,8 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { syncGroup } from '../../../src/core/group/sync.js';
 import { TopicExtractor } from '../../../src/core/group/extractors/topic-extractor.js';
-import type { RepoHandle } from '../../../src/core/group/types.js';
+import type { GroupConfig, RepoHandle, StoredContract } from '../../../src/core/group/types.js';
 
 describe('TopicExtractor', () => {
   let tmpDir: string;
@@ -68,6 +69,160 @@ public void handleUserCreated(ConsumerRecord<String, String> record) {
       expect(producers).toHaveLength(1);
       expect(producers[0].contractId).toBe('topic::user.created');
       expect(producers[0].meta.broker).toBe('kafka');
+    });
+  });
+
+  describe('RocketMQ — Java', () => {
+    it('extracts dynamic RocketMQ producer and consumer topic contracts', async () => {
+      writeFile(
+        'src/main/resources/application.properties',
+        `
+rocketmq.orderPaid.topic=vip_trade_msg_order_paid
+rocketmq.producer.topic=save_book_venue_receive_seat_order_v2
+`,
+      );
+      writeFile(
+        'src/main/java/OrderPaidConsumer.java',
+        `
+@RocketMQMessageListener(
+  topic = "\${rocketmq.orderPaid.topic}",
+  consumerGroup = "CG-order-paid")
+class OrderPaidConsumer implements RocketMQListener<String> {}
+`,
+      );
+      writeFile(
+        'src/main/java/SeatOrderProducer.java',
+        `
+class SeatOrderProducer {
+  @Value("\${rocketmq.producer.topic:save_book_venue_receive_seat_order}")
+  private String topic;
+  void send(String body) {
+    rocketMQTemplate.syncSend(topic, MessageBuilder.withPayload(body).build());
+  }
+}
+`,
+      );
+
+      const contracts = await extractor.extract(null, tmpDir, makeRepo(tmpDir));
+      const rocketMqContracts = contracts.filter((c) => c.meta.broker === 'rocketmq');
+
+      expect(rocketMqContracts).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            contractId: 'topic::vip_trade_msg_order_paid',
+            role: 'consumer',
+            meta: expect.objectContaining({
+              topicName: 'vip_trade_msg_order_paid',
+              broker: 'rocketmq',
+            }),
+          }),
+          expect.objectContaining({
+            contractId: 'topic::save_book_venue_receive_seat_order_v2',
+            role: 'provider',
+            meta: expect.objectContaining({
+              topicName: 'save_book_venue_receive_seat_order_v2',
+              broker: 'rocketmq',
+            }),
+          }),
+        ]),
+      );
+    });
+
+    it('group sync links RocketMQ producer and consumer contracts exactly', async () => {
+      const producerRoot = path.join(tmpDir, 'producer');
+      const consumerRoot = path.join(tmpDir, 'consumer');
+      const writeRepoFile = (root: string, relPath: string, content: string): void => {
+        const full = path.join(root, relPath);
+        fs.mkdirSync(path.dirname(full), { recursive: true });
+        fs.writeFileSync(full, content);
+      };
+
+      writeRepoFile(
+        producerRoot,
+        'src/main/resources/application.properties',
+        'rocketmq.producer.topic=order_paid_topic\n',
+      );
+      writeRepoFile(
+        producerRoot,
+        'src/main/java/OrderPaidProducer.java',
+        `
+class OrderPaidProducer {
+  @Value("\${rocketmq.producer.topic}")
+  private String topic;
+  void send(String body) {
+    rocketMQTemplate.syncSend(topic, MessageBuilder.withPayload(body).build());
+  }
+}
+`,
+      );
+      writeRepoFile(
+        consumerRoot,
+        'src/main/resources/application.properties',
+        'rocketmq.consumer.topic=order_paid_topic\n',
+      );
+      writeRepoFile(
+        consumerRoot,
+        'src/main/java/OrderPaidConsumer.java',
+        `
+@RocketMQMessageListener(
+  topic = "\${rocketmq.consumer.topic}",
+  consumerGroup = "CG-order-paid")
+class OrderPaidConsumer implements RocketMQListener<String> {}
+`,
+      );
+
+      const topicExtractor = new TopicExtractor();
+      const producerContracts = (
+        await topicExtractor.extract(null, producerRoot, makeRepo(producerRoot))
+      ).map((contract): StoredContract => ({ ...contract, repo: 'apps/producer' }));
+      const consumerContracts = (
+        await topicExtractor.extract(null, consumerRoot, makeRepo(consumerRoot))
+      ).map((contract): StoredContract => ({ ...contract, repo: 'apps/consumer' }));
+
+      const config: GroupConfig = {
+        version: 1,
+        name: 'rocketmq-test',
+        description: '',
+        repos: {
+          'apps/producer': 'producer',
+          'apps/consumer': 'consumer',
+        },
+        links: [],
+        packages: {},
+        detect: {
+          http: false,
+          grpc: false,
+          thrift: false,
+          topics: true,
+          shared_libs: false,
+          embedding_fallback: false,
+          includes: false,
+          workspace_deps: false,
+        },
+        matching: {
+          bm25_threshold: 0.7,
+          embedding_threshold: 0.65,
+          max_candidates_per_step: 3,
+        },
+      };
+
+      const result = await syncGroup(config, {
+        extractorOverride: async () => [...producerContracts, ...consumerContracts],
+        skipWrite: true,
+        exactOnly: true,
+        skipEmbeddings: true,
+      });
+
+      expect(result.crossLinks).toEqual([
+        expect.objectContaining({
+          type: 'topic',
+          contractId: 'topic::order_paid_topic',
+          matchType: 'exact',
+          confidence: 1,
+          from: expect.objectContaining({ repo: 'apps/consumer' }),
+          to: expect.objectContaining({ repo: 'apps/producer' }),
+        }),
+      ]);
     });
   });
 
