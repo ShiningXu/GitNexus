@@ -270,10 +270,16 @@ export interface ExtractedToolDef {
 
 export interface ExtractedORMQuery {
   filePath: string;
-  orm: 'prisma' | 'supabase';
+  orm: 'prisma' | 'supabase' | 'mybatis';
   model: string;
   method: string;
   lineNumber: number;
+  /** MyBatis XML statement id, usually the mapper method name. */
+  mapperId?: string;
+  /** MyBatis SQL operation type from the XML statement tag. */
+  sqlOp?: 'select' | 'insert' | 'update' | 'delete';
+  /** Simple mapper class name from the XML namespace. */
+  mapperClassName?: string;
 }
 
 /** Constructor bindings keyed by filePath for cross-file type resolution */
