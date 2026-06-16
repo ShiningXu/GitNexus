@@ -44,6 +44,18 @@ export const qualifyRustImplTargetByModScope = (
 };
 
 /**
+ * #1991: scope-label predicate that single-sources the `nodeLabel === 'Trait'`
+ * checks in parsing-processor.ts / parse-worker.ts. A Ruby `module` maps to the
+ * `Trait` registry label but is NOT a typeDeclaration, so `extractQualifiedName`
+ * bails on it; these node labels are instead qualified via the scope walk
+ * (`qualifyScopeName`) so same-tail nested modules get distinct ids. Keeping the
+ * literal in one place stops the four hand-maintained copies (two each in the
+ * sequential and worker definition paths) from drifting apart. Pure predicate —
+ * value-identical to the inlined `nodeLabel === 'Trait'`.
+ */
+export const isQualifiableScopeLabel = (nodeLabel: string): boolean => nodeLabel === 'Trait';
+
+/**
  * Ordered list of definition capture keys for tree-sitter query matches.
  * Used to extract the definition node from a capture map.
  */
@@ -168,6 +180,7 @@ export const FUNCTION_NODE_TYPES = new Set([
   'anonymous_function',
   // Kotlin
   'lambda_literal',
+  'secondary_constructor', // F48: methodNodeTypes superset invariant
   // Swift
   'init_declaration',
   'deinit_declaration',
@@ -239,9 +252,9 @@ export const CONTAINER_TYPE_TO_LABEL: Record<string, string> = {
   extension_declaration: 'Extension',
   class: 'Class',
   // Ruby `module` declarations map to `Trait` so they participate in the
-  // class-like type registry used by `lookupClassByName` / `buildHeritageMap`.
-  // This lets `include` / `extend` / `prepend` mixin heritage resolve to
-  // the providing module. Safe for non-Ruby languages: the only supported
+  // class-like type registry used by `lookupClassByName` / inheritance
+  // resolution. This lets `include` / `extend` / `prepend` mixin heritage
+  // resolve to the providing module. Safe for non-Ruby languages: the only supported
   // grammar that uses the bare `module` AST node type as a container is
   // Ruby (Rust uses `mod_item`). Any new language adding a `module` node
   // type must explicitly reclassify here.
@@ -503,18 +516,50 @@ export const findEnclosingClassInfo = (
         //     different mods own through DISTINCT nodes. The Impl-node
         //     materialization (parsing-processor / parse-worker) mirrors this, so
         //     the owner id == the Impl node id byte-for-byte (#1982).
-        const firstType = children.find(
-          (c: SyntaxNode) => c.type === 'type_identifier' || c.type === 'scoped_type_identifier',
+        //   - GENERIC (`impl<T> Inner<T>`, generic_type): the @definition.impl
+        //     node is materialized only when the generic base is a bare
+        //     `type_identifier` (tree-sitter-queries.ts), qualified the same way —
+        //     so drill into the base and mirror that gate, keeping the owner id ==
+        //     the node id byte-for-byte (#1992). A generic over a SCOPED base
+        //     (`impl<T> a::Inner<T>`) materializes NO node, so it must produce NO
+        //     owner (the method orphans — scoped-generic deferred, #1992).
+        const implTarget = children.find(
+          (c: SyntaxNode) =>
+            c.type === 'type_identifier' ||
+            c.type === 'scoped_type_identifier' ||
+            c.type === 'generic_type',
         );
-        if (firstType) {
-          const ownerKey =
-            firstType.type === 'type_identifier'
-              ? qualifyRustImplTargetByModScope(current, firstType.text)
-              : firstType.text;
-          return {
-            classId: generateId('Impl', `${filePath}:${ownerKey}`),
-            className: firstType.text,
-          };
+        if (implTarget) {
+          const baseType =
+            implTarget.type === 'generic_type'
+              ? (implTarget.childForFieldName?.('type') ?? null)
+              : implTarget;
+          if (baseType?.type === 'type_identifier') {
+            // Bare target (`impl Inner` or `impl<T> Inner<T>`): qualify by mod scope.
+            // #1992 follow-up: qualify `className` too (not just `classId`). The
+            // method node id is keyed `${className}.${name}`, so a bare tail collapses
+            // two same-tail bare impls that ALSO share a method name (`a::Inner::m` +
+            // `b::Inner::m` both → `Inner.m`) onto one Method node (graph addNode is
+            // first-write-wins). Qualifying className → `a.Inner.m` / `b.Inner.m` keeps
+            // them distinct. Symmetric: the call-resolution fallback rebuilds the same
+            // `${className}.${name}` from the same enclosing-impl walk, so def and call
+            // ids still agree. Owner edge anchors on `classId` (already qualified).
+            const qualified = qualifyRustImplTargetByModScope(current, baseType.text);
+            return {
+              classId: generateId('Impl', `${filePath}:${qualified}`),
+              className: qualified,
+            };
+          }
+          if (baseType?.type === 'scoped_type_identifier' && implTarget.type !== 'generic_type') {
+            // Top-level scoped `impl a::Inner`: key by full raw text (#1975).
+            return {
+              classId: generateId('Impl', `${filePath}:${baseType.text}`),
+              className: baseType.text,
+            };
+          }
+          // generic-over-scoped (`impl<T> a::Inner<T>`) and any other base: fall
+          // through with no owner — no @definition.impl node exists, so attributing
+          // a method to a synthesized id would orphan it against a phantom owner.
         }
       }
 
@@ -538,6 +583,19 @@ export const findEnclosingClassInfo = (
           current.children?.some((c: SyntaxNode) => c.type === 'interface')
         ) {
           label = 'Interface';
+        }
+        // class_declaration with a `declaration_kind` field collapses several
+        // type kinds onto one node (tree-sitter-swift: class / struct / enum /
+        // extension / actor). The structure query labels struct → Struct and
+        // enum → Enum; refine the owner label to match so a member edge
+        // (HAS_METHOD / HAS_PROPERTY) anchors on the real Enum/Struct node id
+        // rather than a non-existent `Class:` id (F79). Gated on the field
+        // being present, so it is a no-op for grammars whose class_declaration
+        // has no `declaration_kind` field (e.g. Kotlin).
+        if (current.type === 'class_declaration' && label === 'Class') {
+          const declKind = current.childForFieldName?.('declaration_kind')?.text;
+          if (declKind === 'struct') label = 'Struct';
+          else if (declKind === 'enum') label = 'Enum';
         }
         const templateArguments = extractTemplateArguments(nameNode.text);
         const classIdName =
@@ -774,6 +832,62 @@ export const inferFunctionLabel = (nodeType: string): NodeLabel =>
 
 /** Argument list node types shared between countCallArguments and call-resolution helpers. */
 export const CALL_ARGUMENT_LIST_TYPES = new Set(['arguments', 'argument_list', 'value_arguments']);
+
+/**
+ * Function/method parameter-list node types across grammars. Used to tell a
+ * PARAMETER-property (a constructor parameter that is also a class field, e.g.
+ * TypeScript `constructor(public name: string)`) apart from a function-BODY
+ * local: a property reached through one of these — rather than through the
+ * function's executable body — is a genuine class member, so the
+ * function-local-property guard must NOT strip its owner edge.
+ */
+export const PARAMETER_LIST_NODE_TYPES = new Set([
+  'formal_parameters', // TypeScript / JavaScript
+  'parameters', // Python / C#
+  'parameter_list', // Java / Go / C / Swift
+  'function_value_parameters', // Kotlin
+  'class_parameters', // Scala-like / future grammars
+]);
+
+/**
+ * Executable local-scope boundaries for the property-ownership guard
+ * (`isFunctionLocalProperty` in parse-worker.ts). A `Property` capture whose
+ * nearest enclosing scope — walking up before any class container — is one of
+ * these executable bodies is a function-local binding, NOT a class member, so it
+ * must not receive a class `HAS_PROPERTY` owner edge.
+ *
+ * Derived from FUNCTION_NODE_TYPES, with two deliberate adjustments found by the
+ * #1919 review of the original guard:
+ *  - EXCLUDES Dart's bare signature wrappers (`function_signature` /
+ *    `method_signature`). A Dart getter/setter NAME lives under `method_signature`,
+ *    yet it is a class-member declaration, not a local inside an executable body;
+ *    treating the signature as a scope boundary OVER-stripped every Dart class
+ *    accessor's owner edge. (Signatures are Dart-only; no language emits a
+ *    legitimately-function-local Property under one.)
+ *  - INCLUDES accessor + initializer bodies (Kotlin `anonymous_initializer` /
+ *    `getter` / `setter`, Swift `computed_property` / `computed_getter` /
+ *    `computed_setter` / `computed_modify`). Destructuring/locals inside these ARE
+ *    function-local, yet they are absent from FUNCTION_NODE_TYPES; omitting them
+ *    UNDER-stripped and emitted spurious class `HAS_PROPERTY` edges for
+ *    `init {}` / accessor-body destructuring bindings.
+ *
+ * Kept separate from FUNCTION_NODE_TYPES because that set has many other consumers
+ * (e.g. enclosing-callable resolution) where signatures must remain function nodes
+ * and accessor bodies must not.
+ */
+export const LOCAL_SCOPE_BODY_NODE_TYPES: ReadonlySet<string> = new Set(
+  [...FUNCTION_NODE_TYPES]
+    .filter((t) => t !== 'function_signature' && t !== 'method_signature')
+    .concat([
+      'anonymous_initializer', // Kotlin: init { }
+      'getter', // Kotlin: val x get() { }
+      'setter', // Kotlin: var x set(v) { }
+      'computed_property', // Swift: var x: T { get set }
+      'computed_getter', // Swift: get { }
+      'computed_setter', // Swift: set { }
+      'computed_modify', // Swift: _modify { }
+    ]),
+);
 
 // ============================================================================
 // Generic AST traversal helpers (shared by parse-worker + php-helpers)

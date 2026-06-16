@@ -6,6 +6,11 @@ import {
   unquoteLiteral,
   type LanguagePatterns,
 } from '../tree-sitter-scanner.js';
+import {
+  METHOD_ANNOTATION_TO_HTTP,
+  isRouteMemberKey,
+  findEnclosingClass,
+} from '../../../ingestion/route-extractors/spring-shared.js';
 import type {
   HttpDetection,
   HttpFileDetections,
@@ -33,14 +38,6 @@ import type {
  * OkHttp, Java/Apache HttpClient) keep their own focused queries.
  */
 
-const METHOD_ANNOTATION_TO_HTTP: Record<string, string> = {
-  GetMapping: 'GET',
-  PostMapping: 'POST',
-  PutMapping: 'PUT',
-  DeleteMapping: 'DELETE',
-  PatchMapping: 'PATCH',
-};
-
 // Each route-defining annotation has two AST shapes — a positional argument
 // and a named one — that must both be matched:
 //   @RequestMapping("/api")          → (annotation_argument_list (string_literal))
@@ -55,6 +52,7 @@ const METHOD_ANNOTATION_TO_HTTP: Record<string, string> = {
 interface SpringRouteBinding {
   method: string;
   path: string;
+  ownerPrefix?: string;
 }
 
 interface SpringMethodInfo {
@@ -402,19 +400,9 @@ const APACHE_HTTP_CLIENT_PATTERNS = compilePatterns({
 } satisfies LanguagePatterns<Record<string, never>>);
 
 /**
- * Find the nearest enclosing class/interface declaration ancestor for
- * a node, or null if the node is top-level. Tree-sitter's
- * SyntaxNode.parent walks one level at a time.
+ * Find the nearest enclosing interface declaration ancestor for a node, or
+ * null if the node is top-level.
  */
-function findEnclosingClass(node: Parser.SyntaxNode): Parser.SyntaxNode | null {
-  let cur: Parser.SyntaxNode | null = node.parent;
-  while (cur) {
-    if (cur.type === 'class_declaration') return cur;
-    cur = cur.parent;
-  }
-  return null;
-}
-
 function findEnclosingInterface(node: Parser.SyntaxNode): Parser.SyntaxNode | null {
   let cur: Parser.SyntaxNode | null = node.parent;
   while (cur) {
@@ -435,6 +423,25 @@ function joinPath(prefix: string, methodPath: string): string {
   const cleanSub = methodPath.replace(/^\/+/, '');
   if (!cleanPrefix) return `/${cleanSub}`;
   return `/${cleanPrefix}/${cleanSub}`;
+}
+
+function joinInheritedSpringPath(
+  controllerPrefix: string,
+  inheritedPath: string,
+  inheritedOwnerPrefix = '',
+): string {
+  const joined = joinPath(controllerPrefix, inheritedPath);
+  const cleanPrefix = controllerPrefix.replace(/^\/+/, '').replace(/\/+$/, '');
+  const cleanOwnerPrefix = inheritedOwnerPrefix.replace(/^\/+/, '').replace(/\/+$/, '');
+  const cleanInherited = inheritedPath.replace(/^\/+/, '');
+  if (!cleanPrefix) return joined;
+  if (
+    cleanPrefix === cleanOwnerPrefix &&
+    (cleanInherited === cleanPrefix || cleanInherited.startsWith(`${cleanPrefix}/`))
+  ) {
+    return `/${cleanInherited}`;
+  }
+  return joined;
 }
 
 function getNodeName(node: Parser.SyntaxNode): string | null {
@@ -459,18 +466,6 @@ function hasAnnotation(node: Parser.SyntaxNode, names: string | readonly string[
     stack.push(...cur.namedChildren);
   }
   return false;
-}
-
-/**
- * A named annotation argument contributes a route only when its member key is
- * `path` or `value`; a positional argument (no key node) always qualifies.
- * This is the JS-side replacement for the in-query `^(path|value)$` filter and
- * drops Spring's non-route string attributes (`produces`, `consumes`,
- * `headers`, `name`, `params`) that would otherwise be mis-read as routes.
- */
-function isRouteMemberKey(keyNode: Parser.SyntaxNode | undefined): boolean {
-  if (!keyNode) return true;
-  return keyNode.text === 'path' || keyNode.text === 'value';
 }
 
 interface MethodRouteAnnotation {
@@ -682,6 +677,7 @@ function scanSpringProject(files: readonly HttpScanInput[]): HttpFileDetections[
         type.classPrefixes.map((prefix) => ({
           method: route.method,
           path: prefix ? joinPath(prefix, route.path) : route.path,
+          ownerPrefix: prefix,
         })),
       );
       if (routes.length > 0) methodMap.set(method.name, routes);
@@ -701,7 +697,7 @@ function scanSpringProject(files: readonly HttpScanInput[]): HttpFileDetections[
         return routes.flatMap((route) =>
           type.classPrefixes.map((prefix) => ({
             method: route.method,
-            path: joinPath(prefix, route.path),
+            path: joinInheritedSpringPath(prefix, route.path, route.ownerPrefix),
           })),
         );
       });
