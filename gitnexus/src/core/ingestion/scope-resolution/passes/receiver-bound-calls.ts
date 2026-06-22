@@ -54,7 +54,12 @@ import {
   findValueBindingInScope,
   isClassLike,
 } from '../scope/walkers.js';
-import { tryEmitEdge, tryEmitEdgeWithExplicitTargetId } from '../graph-bridge/edges.js';
+import {
+  tryEmitEdge,
+  tryEmitEdgeWithExplicitTargetId,
+  type CalleeIdCaptureCtx,
+} from '../graph-bridge/edges.js';
+import type { CalleeIdSink } from '../graph-bridge/callee-id-sink.js';
 import { resolveCompoundReceiverClass } from '../passes/compound-receiver.js';
 import { resolveDefGraphId } from '../graph-bridge/ids.js';
 import {
@@ -85,6 +90,7 @@ type ReceiverBoundProviderSubset = Pick<
   | 'resolveReceiverMember'
   | 'resolveThisViaEnclosingClass'
   | 'conversionRankFn'
+  | 'conversionOnlyArgTypePrefixes'
   | 'constraintCompatibility'
   | 'isStaticOnly'
 >;
@@ -147,6 +153,10 @@ export function emitReceiverBoundCalls(
   model: SemanticModel,
   options: {
     readonly recordResolutionOutcome?: ResolutionOutcomeRecorder;
+    /** Resolved-callee-id capture sink (#2227 U2). Threaded in only under
+     *  `--pdg`; `undefined` ⇒ zero overhead, byte-identity (R4). Per-file
+     *  capture contexts are built from this + `parsed.filePath` in the loop. */
+    readonly calleeIdSink?: CalleeIdSink;
   } = {},
 ): number {
   let emitted = 0;
@@ -199,6 +209,7 @@ export function emitReceiverBoundCalls(
     primaryMemberDef: SymbolDefinition,
     site: ParsedFile['referenceSites'][number],
     confidence: number,
+    calleeCapture: CalleeIdCaptureCtx | undefined,
   ): number => {
     if (ownerDef.type !== 'Interface') return 0;
     const impls = implementorsByInterfaceDefId.get(ownerDef.nodeId);
@@ -224,6 +235,7 @@ export function emitReceiverBoundCalls(
         seen,
         confidence,
         collapse,
+        calleeCapture,
       );
       if (ok) n++;
     }
@@ -232,6 +244,13 @@ export function emitReceiverBoundCalls(
 
   for (const parsed of parsedFiles) {
     const namespaceTargets = collectNamespaceTargets(parsed, scopes);
+    // Per-file resolved-callee-id capture context (#2227 U2). Built once per
+    // file; `undefined` when the sink is absent (pdg off) so the `tryEmitEdge`
+    // capture is a no-op and emission stays byte-identical (R4).
+    const calleeCapture: CalleeIdCaptureCtx | undefined =
+      options.calleeIdSink !== undefined
+        ? { sink: options.calleeIdSink, filePath: parsed.filePath }
+        : undefined;
 
     for (const site of parsed.referenceSites) {
       if (site.kind !== 'call' && site.kind !== 'read' && site.kind !== 'write') continue;
@@ -329,6 +348,7 @@ export function emitReceiverBoundCalls(
               seen,
               0.85,
               collapse,
+              calleeCapture,
             );
             if (ok) emitted++;
             // Always mark handled when the site was resolved, even
@@ -416,6 +436,7 @@ export function emitReceiverBoundCalls(
               seen,
               0.85,
               collapse,
+              calleeCapture,
             );
             if (ok) emitted++;
             // Always mark handled when the site was resolved, even
@@ -496,6 +517,7 @@ export function emitReceiverBoundCalls(
               seen,
               confidence,
               collapse,
+              calleeCapture,
             );
             if (ok) emitted++;
             handledSites.add(siteKey);
@@ -519,6 +541,7 @@ export function emitReceiverBoundCalls(
                 {
                   argumentTypeClasses: site.argumentTypeClasses,
                   conversionRankFn: provider.conversionRankFn,
+                  conversionOnlyArgTypePrefixes: provider.conversionOnlyArgTypePrefixes,
                   constraintCompatibility: provider.constraintCompatibility,
                 },
               );
@@ -591,6 +614,7 @@ export function emitReceiverBoundCalls(
               seen,
               confidence,
               collapse,
+              calleeCapture,
             );
             if (ok) emitted++;
             handledSites.add(siteKey);
@@ -628,6 +652,7 @@ export function emitReceiverBoundCalls(
               seen,
               0.85,
               collapse,
+              calleeCapture,
             );
             if (ok) emitted++;
             handledSites.add(siteKey);
@@ -690,6 +715,7 @@ export function emitReceiverBoundCalls(
             seen,
             0.85,
             collapse,
+            calleeCapture,
           );
           if (ok) emitted++;
           handledSites.add(siteKey);
@@ -771,6 +797,7 @@ export function emitReceiverBoundCalls(
             seen,
             confidence,
             collapse,
+            calleeCapture,
           );
           if (ok) emitted++;
           handledSites.add(siteKey);
@@ -829,6 +856,11 @@ export function emitReceiverBoundCalls(
                   memberDef,
                   memberDef.filePath !== parsed.filePath ? 'import-resolved' : 'global',
                   seen,
+                  // Explicit defaults so the trailing capture ctx (#2227 U2) can
+                  // be threaded without changing dedup/confidence behavior.
+                  0.85,
+                  false,
+                  calleeCapture,
                 );
                 if (ok) {
                   emitted++;
@@ -937,6 +969,7 @@ export function emitReceiverBoundCalls(
               seen,
               0.85,
               collapse,
+              calleeCapture,
             );
             if (ok) emitted++;
             // Always mark handled when the site was resolved, even
@@ -1027,6 +1060,7 @@ export function emitReceiverBoundCalls(
               seen,
               confidence,
               collapse,
+              calleeCapture,
             );
             if (ok) emitted++;
             handledSites.add(siteKey);
@@ -1143,12 +1177,20 @@ export function emitReceiverBoundCalls(
               seen,
               confidence,
               collapse,
+              calleeCapture,
             );
             if (ok) emitted++;
             // Interface dispatch: when the primary owner is an
             // Interface, emit secondary CALLS edges to every
             // implementing class's same-named method.
-            emitted += emitInterfaceDispatchFor(ownerDef, memberName, memberDef, site, confidence);
+            emitted += emitInterfaceDispatchFor(
+              ownerDef,
+              memberName,
+              memberDef,
+              site,
+              confidence,
+              calleeCapture,
+            );
             // Always mark handled when the site was resolved, even
             // if the edge was deduplicated (collapse mode), so
             // `emitReferencesViaLookup` doesn't re-emit from the
@@ -1240,6 +1282,7 @@ export function emitReceiverBoundCalls(
             seen,
             confidence,
             collapse,
+            calleeCapture,
           );
           if (ok) emitted++;
           handledSites.add(siteKey);
@@ -1275,6 +1318,7 @@ function pickOverload(
   const candidates = narrowOverloadCandidates(overloads, site.arity, site.argumentTypes, {
     argumentTypeClasses: site.argumentTypeClasses,
     conversionRankFn: provider.conversionRankFn,
+    conversionOnlyArgTypePrefixes: provider.conversionOnlyArgTypePrefixes,
     constraintCompatibility: provider.constraintCompatibility,
   });
   // When narrowing leaves >1 candidate that share identical normalized
@@ -1382,6 +1426,7 @@ function pickFirstNonStaticOnly(
   const candidates = narrowOverloadCandidates(overloads, site.arity, site.argumentTypes, {
     argumentTypeClasses: site.argumentTypeClasses,
     conversionRankFn: provider.conversionRankFn,
+    conversionOnlyArgTypePrefixes: provider.conversionOnlyArgTypePrefixes,
     constraintCompatibility: provider.constraintCompatibility,
   });
   // Same ambiguity handling as `pickOverload`: when normalization
@@ -1427,6 +1472,7 @@ function recordReceiverOverloadSuppression(
   const candidates = narrowOverloadCandidates(overloads, site.arity, site.argumentTypes, {
     argumentTypeClasses: site.argumentTypeClasses,
     conversionRankFn: provider.conversionRankFn,
+    conversionOnlyArgTypePrefixes: provider.conversionOnlyArgTypePrefixes,
     constraintCompatibility: provider.constraintCompatibility,
   });
   const reason: ResolutionSuppressionReason = isOverloadAmbiguousAfterNormalization(

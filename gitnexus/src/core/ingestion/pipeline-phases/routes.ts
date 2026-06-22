@@ -52,6 +52,15 @@ const EXPO_NAV_PATTERNS = [
 export interface RouteEntry {
   filePath: string;
   source: string;
+  /**
+   * HTTP verb for this route when ingestion knows it structurally
+   * (Spring/Laravel framework routes and decorator routes carry
+   * `httpMethod`; filesystem-derived routes — Next.js/Expo/PHP file
+   * routes — do not, so this stays undefined for them). Persisted onto
+   * the Route node so downstream contract extraction can read the verb
+   * from the graph instead of re-parsing the handler source.
+   */
+  method?: string;
 }
 
 export interface RoutesOutput {
@@ -145,6 +154,37 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/**
+ * Canonicalize a route's HTTP verb for persistence on the Route node.
+ * Returns an upper-cased standard method, or `undefined` when the value
+ * is not a real HTTP verb. Laravel `Route::resource` / `apiResource`
+ * surface `httpMethod` values like `resource` / `apiResource` (they
+ * expand to several verbs at runtime), so they must not be stored as a
+ * method — leaving them `undefined` keeps the column clean and lets the
+ * contract extractor fall back to its source-scan path for those routes.
+ */
+const VALID_HTTP_METHODS = new Set([
+  'GET',
+  'POST',
+  'PUT',
+  'PATCH',
+  'DELETE',
+  'HEAD',
+  'OPTIONS',
+  'TRACE',
+  'CONNECT',
+]);
+
+export function normalizeRouteMethod(raw: string | null | undefined): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const verb = raw.trim().toUpperCase();
+  // '*' marks a method-agnostic route (e.g. a Django function view handles any
+  // verb). Preserve it so the contract layer emits a wildcard provider that
+  // matches consumers of any method, instead of silently narrowing to GET.
+  if (verb === '*') return '*';
+  return VALID_HTTP_METHODS.has(verb) ? verb : undefined;
+}
+
 export const routesPhase: PipelinePhase<RoutesOutput> = {
   name: 'routes',
   deps: ['parse'],
@@ -223,6 +263,7 @@ export const routesPhase: PipelinePhase<RoutesOutput> = {
       addRoute(routeUrl, {
         filePath: route.filePath,
         source: 'framework-route',
+        method: normalizeRouteMethod(route.httpMethod),
       });
       if (route.routeName && !namedRouteRegistry.has(route.routeName)) {
         namedRouteRegistry.set(route.routeName, routeUrl);
@@ -233,6 +274,7 @@ export const routesPhase: PipelinePhase<RoutesOutput> = {
       addRoute(url, {
         filePath: dr.filePath,
         source: `decorator-${dr.decoratorName}`,
+        method: normalizeRouteMethod(dr.httpMethod),
       });
     }
 
@@ -242,7 +284,7 @@ export const routesPhase: PipelinePhase<RoutesOutput> = {
       handlerContents = await readFileContents(ctx.repoPath, handlerPaths);
 
       for (const [routeURL, entry] of routeRegistry) {
-        const { filePath: handlerPath, source: routeSource } = entry;
+        const { filePath: handlerPath, source: routeSource, method: routeMethod } = entry;
         const content = handlerContents.get(handlerPath);
 
         const { responseKeys, errorKeys } = content
@@ -261,6 +303,7 @@ export const routesPhase: PipelinePhase<RoutesOutput> = {
           properties: {
             name: routeURL,
             filePath: handlerPath,
+            ...(routeMethod ? { method: routeMethod } : {}),
             ...(responseKeys ? { responseKeys } : {}),
             ...(errorKeys ? { errorKeys } : {}),
             ...(middleware && middleware.length > 0 ? { middleware } : {}),

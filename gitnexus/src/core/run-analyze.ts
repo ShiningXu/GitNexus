@@ -21,10 +21,12 @@ import {
   executeQuery,
   executeWithReusedStatement,
   closeLbug,
+  closeLbugBeforeExit,
   loadCachedEmbeddings,
   deleteNodesForFile,
   deleteAllCommunitiesAndProcesses,
   deleteAllInterprocTaintPaths,
+  deleteAllCallSummaries,
   queryImporters,
   loadFTSExtension,
 } from './lbug/lbug-adapter.js';
@@ -41,6 +43,7 @@ import {
   loadMeta,
   ensureGitNexusIgnored,
   registerRepo,
+  isRepoRegistered,
   cleanupOldKuzuFiles,
   INCREMENTAL_SCHEMA_VERSION,
   type RepoMeta,
@@ -61,6 +64,7 @@ import {
 } from './ingestion/taint/interproc-solver.js';
 import { DEFAULT_PDG_MAX_INTERPROC_EDGES } from './ingestion/taint/interproc-emit.js';
 import { taintModelVersion } from './ingestion/taint/typescript-model.js';
+import { parseTruthyEnv, parsePositiveIntEnv } from './ingestion/utils/env.js';
 import { computeFileHashes, diffFileHashes } from '../storage/file-hash.js';
 import {
   extractChangedSubgraph,
@@ -171,6 +175,19 @@ export interface AnalyzeOptions {
   pdgMaxInterprocHops?: number;
   pdgMaxInterprocEdges?: number;
   /**
+   * Stream the BasicBlock + intra-file PDG-edge layer to CSV-on-disk during the
+   * emit loop instead of materializing it in the in-memory graph, bounding peak
+   * RSS to O(chunk) for full-kernel-scale repos (#2202). Only engages on a full
+   * rebuild — `resolveStreamPdgEmit` additionally requires `force === true`
+   * (the pre-pipeline guarantee of a full rebuild). May also be enabled via
+   * `GITNEXUS_STREAM_PDG_EMIT`. Memory-only; byte-identical output; not stamped
+   * into `RepoMeta.pdg`. */
+  streamPdgEmit?: boolean;
+  /** Streamed PDG-emit write buffer (rows). `undefined` ⇒
+   *  `DEFAULT_PDG_EMIT_CHUNK_ROWS`. May also be set via
+   *  `GITNEXUS_PDG_EMIT_CHUNK_SIZE`. Memory-only (#2202). */
+  pdgEmitChunkSize?: number;
+  /**
    * Default branch threaded into generated AGENTS.md / CLAUDE.md so the
    * regression-compare example uses the configured branch instead of a
    * hardcoded "main" (#243). Resolved by the CLI; `undefined` here keeps the
@@ -217,6 +234,15 @@ export interface AnalyzeOptions {
    * consumer scan unchanged.
    */
   fetchWrappers?: string[];
+  /**
+   * The caller will `process.exit()` immediately after this analyze returns (the
+   * CLI `analyze` command). When set, the finalize/error close CHECKPOINTs for
+   * durability but skips the native `conn.close()`/`db.close()`, which can
+   * double-free in LadybugDB's `ClientContext` destructor after large `--pdg`
+   * writes (gdb-confirmed) — aborting the process AFTER a fully-written index.
+   * Process exit reclaims the handles. Long-lived callers (MCP server, tests)
+   * leave this unset so they get a real close. See `closeLbug`. */
+  skipNativeCloseOnExit?: boolean;
 }
 
 export interface AnalyzeResult {
@@ -415,8 +441,65 @@ export const resolvePdgConfig = (options: PdgOptions): RepoMeta['pdg'] =>
         // outlive the model that produced them — ANY model-content change
         // ships as a new digest and repopulates the taint edges.
         taintModelVersion,
+        // #2201 review R3: reaching-defs solver identity. The SSA-sparse rewrite
+        // computes full facts for deep-loop functions the dense worklist used to
+        // truncate to empty, so an existing `--pdg` index carries stale-truncated
+        // REACHING_DEF rows. Absent on any pre-#2201 stamp → the key-union
+        // pdgModeMismatch trips on the first upgraded run and forces the full
+        // writeback that recomputes the fuller coverage (no `--force` needed).
+        // Bump this tag on any future change to which facts the solver emits.
+        reachingDefSolver: 'ssa-sparse-v1',
+        // PDG FU-C: this run records CALL_SUMMARY return-value-ascent edges.
+        // Absent on any pre-FU-C (v3) stamp → the key-union pdgModeMismatch trips
+        // the first FU-C-aware run over an existing `--pdg` index and forces the
+        // full writeback that materialises CALL_SUMMARY edges without `--force`;
+        // and `impact`'s PDG mode reads its absence to note "no return-value
+        // ascent (re-index for CALL_SUMMARY)" on a v3 index (intra slice intact).
+        hasCallSummary: true,
       }
     : undefined;
+
+/**
+ * Whether streaming/chunked PDG graph emit (#2202) engages this run.
+ *
+ * Streaming flushes the BasicBlock + intra-file PDG-edge layer to CSV-on-disk
+ * during the emit loop and never lands it in the in-memory graph, bounding peak
+ * RSS to O(chunk). It is sound ONLY on a full rebuild: the incremental
+ * writeback (`extractChangedSubgraph`) reads BasicBlock nodes back out of the
+ * in-memory graph, which streaming has already offloaded. `force === true` is
+ * the pre-pipeline guarantee of a full rebuild — `isIncremental` has
+ * `!force` as a necessary condition — so gating on it avoids the deliberately
+ * absent pre-pipeline incremental prediction (see the `isIncremental` note).
+ *
+ * Requires `pdg === true` (nothing to stream otherwise). Enabled by either the
+ * explicit `streamPdgEmit` option or the `GITNEXUS_STREAM_PDG_EMIT` env toggle.
+ * Memory-only — NOT part of {@link resolvePdgConfig}, so toggling it never
+ * trips `pdgModeMismatch`. Read every call (not memoized) so `vi.stubEnv`
+ * works in tests. Pure + exported for testing.
+ */
+export const resolveStreamPdgEmit = (options: {
+  pdg?: boolean;
+  force?: boolean;
+  streamPdgEmit?: boolean;
+}): boolean =>
+  options.pdg === true &&
+  options.force === true &&
+  (options.streamPdgEmit === true || parseTruthyEnv(process.env.GITNEXUS_STREAM_PDG_EMIT));
+
+/**
+ * Resolve the streamed PDG-emit write-buffer size (#2202). Explicit option wins
+ * over `GITNEXUS_PDG_EMIT_CHUNK_SIZE`; `undefined` ⇒ the sink's
+ * `DEFAULT_PDG_EMIT_CHUNK_ROWS`. Memory-only; does not affect emitted bytes.
+ */
+export const resolvePdgEmitChunkSize = (options: {
+  pdgEmitChunkSize?: number;
+}): number | undefined => {
+  // Only honor a positive-integer explicit option; `0`/negative is NOT nullish
+  // so `?? env` would pass it through and make the sink flush every row.
+  const opt = options.pdgEmitChunkSize;
+  if (opt !== undefined && Number.isInteger(opt) && opt > 0) return opt;
+  return parsePositiveIntEnv(process.env.GITNEXUS_PDG_EMIT_CHUNK_SIZE);
+};
 
 /**
  * Whether the requested `--pdg` configuration differs from the one the
@@ -441,6 +524,14 @@ export const pdgModeMismatch = (recorded: RepoMeta['pdg'], options: PdgOptions):
   // a full writeback that populates REACHING_DEF rows without `--force`.
   const reqRecord = requested as Record<string, unknown>;
   const recRecord = recorded as Record<string, unknown>;
+  // INVARIANT: every value stamped by resolvePdgConfig MUST be a SCALAR (string /
+  // number / boolean). This comparison is a shallow `!==`, so an OBJECT or ARRAY
+  // value would compare by REFERENCE — two structurally-equal values from
+  // different runs would always be `!==`, tripping pdgModeMismatch on every
+  // re-analyze and forcing a needless full writeback. e.g. do NOT change
+  // `hasCallSummary: true` to a per-language object like `{ ts: true, ... }`; keep
+  // the diagnostic per-language refinement in the impact CONSUMER (see
+  // pdg-impact.ts assemblePdgImpactResult), not in this version discriminator.
   for (const key of new Set([...Object.keys(reqRecord), ...Object.keys(recRecord)])) {
     if (reqRecord[key] !== recRecord[key]) return true;
   }
@@ -688,7 +779,21 @@ export async function runFullAnalysis(
           return true; // conservative on git failure
         }
       })();
-      if (!dirty) {
+      // Registration wrinkle around the fast path (#2264). A prior
+      // `analyze --name X` that hit a name collision writes meta.json (meta-save
+      // runs before registerRepo) then fails before registering, leaving the
+      // index up-to-date but UNREGISTERED. When the user re-runs with
+      // --allow-duplicate-name they explicitly want it registered, so fall
+      // through to the pipeline (which registers it, honoring the flag) instead
+      // of early-returning an unregistered repo the flag could never heal.
+      // For a PLAIN analyze we deliberately do NOT self-heal: an up-to-date but
+      // unregistered repo early-returns here and the CLI's assertAnalysisFinalized
+      // surfaces it as a hard failure (#1169) rather than silently registering a
+      // possibly half-finalized index. `isRepoRegistered` is only read on the
+      // opt-in branch so the common fast path keeps its single-stat cost.
+      const healUnregistered =
+        options.allowDuplicateName === true && !(await isRepoRegistered(repoPath));
+      if (!dirty && !healUnregistered) {
         await ensureGitNexusIgnored(repoPath);
         return {
           // `resolveRepoIdentityRoot` collapses worktree roots to the
@@ -820,6 +925,11 @@ export async function runFullAnalysis(
       pdgMaxInterprocFindings: options.pdgMaxInterprocFindings,
       pdgMaxInterprocHops: options.pdgMaxInterprocHops,
       pdgMaxInterprocEdges: options.pdgMaxInterprocEdges,
+      // Streaming/chunked PDG emit (#2202) — gated to full-rebuild runs
+      // (force === true) so the incremental writeback never reads back an
+      // offloaded BasicBlock layer. Memory-only; byte-identical output.
+      streamPdgEmit: resolveStreamPdgEmit(options),
+      pdgEmitChunkSize: resolvePdgEmitChunkSize(options),
       fetchWrappers: options.fetchWrappers,
     },
   );
@@ -1047,6 +1157,12 @@ export async function runFullAnalysis(
       //     graph (isGraphWideRelType), mirroring Community/Process.
       if (options.pdg === true) {
         await deleteAllInterprocTaintPaths();
+        // 2c. Drop CALL_SUMMARY edges (PDG FU-C) on an incremental `--pdg`
+        //     writeback. They are re-included from the FULL fresh graph
+        //     (isGraphWideRelType) and the callSummaries phase recomputes every
+        //     summary each run, so delete-all-then-rebuild keeps an unchanged
+        //     function's summary from being lost — same contract as TAINT_PATH.
+        await deleteAllCallSummaries();
       }
 
       // 3. Extract the changed subgraph from the FULL ctx.graph and write
@@ -1061,11 +1177,21 @@ export async function runFullAnalysis(
       });
     } else {
       // ── Full rebuild ───────────────────────────────────────────────
-      await loadGraphToLbug(pipelineResult.graph, pipelineResult.repoPath, storagePath, (msg) => {
-        lbugMsgCount++;
-        const pct = Math.min(84, 60 + Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 24));
-        progress('lbug', pct, msg);
-      });
+      // Pass the streamed PDG-emit manifest (#2202) so the BasicBlock layer that
+      // was flushed to CSV during the emit loop is COPY'd alongside the
+      // structural CSVs. Only ever set on a full rebuild (streaming is
+      // force-gated), so the incremental branch above never carries it.
+      await loadGraphToLbug(
+        pipelineResult.graph,
+        pipelineResult.repoPath,
+        storagePath,
+        (msg) => {
+          lbugMsgCount++;
+          const pct = Math.min(84, 60 + Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 24));
+          progress('lbug', pct, msg);
+        },
+        pipelineResult.pdgEmitManifest,
+      );
     }
 
     // ── Phase 3: FTS (85–90%) ─────────────────────────────────────────
@@ -1448,7 +1574,11 @@ export async function runFullAnalysis(
     // Stop the manual checkpoint driver before closeLbug so its
     // in-flight CHECKPOINT cannot race the `safeClose` CHECKPOINT.
     await walCheckpointDriver.stop();
-    await closeLbug();
+    // CLI callers (about to process.exit) skip the native close to dodge a
+    // LadybugDB destructor double-free after --pdg writes — closeLbugBeforeExit
+    // CHECKPOINTs for durability then leaves the handles for process exit to
+    // reclaim (#2264). Long-lived callers close for real.
+    await (options.skipNativeCloseOnExit ? closeLbugBeforeExit() : closeLbug());
 
     progress('done', 100, 'Done');
 
@@ -1469,7 +1599,15 @@ export async function runFullAnalysis(
       /* swallow — surface path is the rethrow below */
     }
     try {
-      await closeLbug();
+      // Skip the native close on the error path too: a real conn.close() after
+      // large --pdg writes can itself abort in LadybugDB's ClientContext
+      // destructor (#2264 review P2), turning an actionable exit-1 into a raw
+      // SIGABRT. closeLbugBeforeExit leaves the handles open, but the CLI catch
+      // now force-exits when isLbugReady() (analyze.ts, #2264 review P1), so the
+      // process still terminates — no hang, no abort. flushWAL keeps the partial
+      // index durable; process exit reclaims the handles. Long-lived callers
+      // (skipNativeCloseOnExit unset) close for real.
+      await (options.skipNativeCloseOnExit ? closeLbugBeforeExit() : closeLbug());
     } catch {
       /* swallow */
     }
