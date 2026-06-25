@@ -39,6 +39,7 @@ import {
   extractJavaRocketMqConsumerEdges,
   processJavaRocketMqConsumerEdges,
 } from '../route-extractors/java-rocketmq-consumers.js';
+import { normalizeExtractedRoutePath } from '../route-extractors/route-path.js';
 import { generateId } from '../../../lib/utils.js';
 import { readFileContents } from '../filesystem-walker.js';
 import { isDev } from '../utils/env.js';
@@ -143,16 +144,12 @@ export function extractTemplateStaticFetchCalls(
   return calls;
 }
 
-export function normalizeExtractedRoutePath(routePath: string, prefix: string | null): string {
-  const pathPart = routePath.trim().replace(/^\/+/, '').replace(/\/+$/g, '');
-  const prefixPart = prefix?.trim().replace(/^\/+/, '').replace(/\/+$/g, '');
-  const joined = prefixPart ? `/${prefixPart}${pathPart ? `/${pathPart}` : ''}` : `/${pathPart}`;
-  return joined.replace(/\/+/g, '/') || '/';
-}
-
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
+
+// Re-exported for existing consumers/tests that import it from the routes phase.
+export { normalizeExtractedRoutePath };
 
 /**
  * Canonicalize a route's HTTP verb for persistence on the Route node.
@@ -199,6 +196,7 @@ export const routesPhase: PipelinePhase<RoutesOutput> = {
       allFetchWrapperDefs,
       allExtractedRoutes,
       allDecoratorRoutes,
+      routeHandlerSymbols,
     } = getPhaseOutput<ParseOutput>(deps, 'parse');
 
     // Local copy — routes phase must not mutate upstream ParseOutput
@@ -297,6 +295,7 @@ export const routesPhase: PipelinePhase<RoutesOutput> = {
         const middleware = mwResult?.chain;
 
         const routeNodeId = generateId('Route', routeURL);
+        const handlerSymbolId = routeHandlerSymbols.get(routeURL);
         ctx.graph.addNode({
           id: routeNodeId,
           label: 'Route',
@@ -304,6 +303,7 @@ export const routesPhase: PipelinePhase<RoutesOutput> = {
             name: routeURL,
             filePath: handlerPath,
             ...(routeMethod ? { method: routeMethod } : {}),
+            ...(handlerSymbolId ? { handlerSymbolId } : {}),
             ...(responseKeys ? { responseKeys } : {}),
             ...(errorKeys ? { errorKeys } : {}),
             ...(middleware && middleware.length > 0 ? { middleware } : {}),

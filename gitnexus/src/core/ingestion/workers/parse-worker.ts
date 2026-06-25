@@ -317,6 +317,16 @@ export interface ExtractedDecoratorRoute {
    * absent ⇒ no prefix applies.
    */
   prefix?: string | null;
+  /**
+   * Name of the handler the route decorator sits on (the decorated
+   * method/function — e.g. `create` for `@PostMapping("/orders") Order create()`).
+   * Captured at extraction where the decorated definition node is in hand, so
+   * the routes phase can resolve it to a real handler symbol UID via the
+   * SemanticModel (same `(filePath, name) → nodeId` lookup Laravel routes use).
+   * Absent when the extractor could not identify the decorated definition;
+   * resolution then falls back (the Route node simply carries no handlerSymbolId).
+   */
+  handlerName?: string;
 }
 
 export interface ExtractedToolDef {
@@ -2147,7 +2157,20 @@ const processFileGroup = (
         `${file.path}:${qualifiedName}${classTemplateTag}${arityTag}${parameterShapeTag}${constraintsTag}`,
       );
 
-      const description = provider.descriptionExtractor?.(nodeLabel, nodeName, captureMap);
+      let description: string | undefined;
+      try {
+        description = provider.descriptionExtractor?.(nodeLabel, nodeName, captureMap);
+      } catch (err) {
+        // A throw here (an unexpected tree-sitter node shape, a provider bug) must
+        // NOT propagate — it would escape processFileGroup to the language-group
+        // catch, which treats any throw as "parser unavailable" and silently drops
+        // every remaining file in the group. Mirrors the extractTemplateConstraints
+        // guard above (#2286 review).
+        reportWarning(
+          `Description extraction failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        description = undefined;
+      }
 
       let frameworkHint = definitionNode
         ? detectFrameworkFromAST(language, (definitionNode.text || '').slice(0, 300))
