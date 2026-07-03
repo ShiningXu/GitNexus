@@ -1115,25 +1115,6 @@ const ROUTE_DECORATOR_NAMES = new Set([
   'PatchMapping',
 ]);
 
-const SPRING_ROUTE_DECORATOR_NAMES = new Set([
-  'RequestMapping',
-  'GetMapping',
-  'PostMapping',
-  'PutMapping',
-  'DeleteMapping',
-  'PatchMapping',
-]);
-
-function isInsideJavaInterface(node: Parser.SyntaxNode): boolean {
-  let cur: Parser.SyntaxNode | null = node.parent;
-  while (cur) {
-    if (cur.type === 'interface_declaration') return true;
-    if (cur.type === 'class_declaration' || cur.type === 'program') return false;
-    cur = cur.parent;
-  }
-  return false;
-}
-
 // ============================================================================
 // ORM Query Detection (Prisma + Supabase)
 // ============================================================================
@@ -1485,9 +1466,7 @@ const processFileGroup = (
           arg: decoratorArg,
         });
 
-        const suppressSpringInterfaceRoute =
-          SPRING_ROUTE_DECORATOR_NAMES.has(decoratorName) && isInsideJavaInterface(decoratorNode);
-        if (ROUTE_DECORATOR_NAMES.has(decoratorName) && !suppressSpringInterfaceRoute) {
+        if (ROUTE_DECORATOR_NAMES.has(decoratorName)) {
           const routePath = decoratorArg || '';
           const method = decoratorName.replace('Mapping', '').toUpperCase();
           const httpMethod = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'].includes(method)
