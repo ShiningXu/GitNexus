@@ -20,9 +20,10 @@
  * (Windows LadybugDB handle release can lag; `cleanupTempDir` retries).
  */
 
+import { execSync } from 'child_process';
 import { writeFile, readFile } from 'fs/promises';
 import path from 'path';
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import {
   getStoragePaths,
   saveMeta,
@@ -34,7 +35,61 @@ import { setupMiniRepo as setupSharedMiniRepo } from '../helpers/mini-repo.js';
 
 const setupMiniRepo = () => setupSharedMiniRepo('gitnexus-incr-orch-');
 
+/** Stage + commit everything in the temp repo (mirrors mini-repo.ts's git calls). */
+const gitCommitAll = (cwd: string, message: string): void => {
+  execSync('git -c user.name=test -c user.email=t@t -c commit.gpgsign=false add -A', {
+    cwd,
+    stdio: 'pipe',
+  });
+  execSync(
+    `git -c user.name=test -c user.email=t@t -c commit.gpgsign=false commit -q -m "${message}"`,
+    { cwd, stdio: 'pipe' },
+  );
+};
+
+/**
+ * Direct count over INJECTS CodeRelation rows — mirrors pdg-mode-flip's
+ * countBasicBlocks: reopen the repo DB, count, close (runFullAnalysis closes
+ * the singleton on completion, so each count owns its own open/close).
+ */
+async function countInjects(repoPath: string): Promise<number> {
+  const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+  const { lbugPath } = getStoragePaths(repoPath);
+  await adapter.initLbug(lbugPath);
+  try {
+    const rows = (await adapter.executeQuery(
+      `MATCH ()-[r:CodeRelation]->() WHERE r.type = 'INJECTS' RETURN count(r) AS c`,
+    )) as Array<{ c: number | bigint }>;
+    return Number(rows[0]?.c ?? 0);
+  } finally {
+    await adapter.closeLbug();
+  }
+}
+
+/** Java DI fixture (#2200): `@Autowired List<IFoo>` + 2 implementers ⇒ exactly
+ *  2 INJECTS edges (Consumer→FooA, Consumer→FooB). Same shapes as the
+ *  spring-di-pipeline integration fixture. */
+const JAVA_DI_FIXTURE: ReadonlyArray<readonly [string, string]> = [
+  ['IFoo.java', 'package com.example;\n\npublic interface IFoo {}\n'],
+  ['FooA.java', 'package com.example;\n\npublic class FooA implements IFoo {}\n'],
+  ['FooB.java', 'package com.example;\n\npublic class FooB implements IFoo {}\n'],
+  [
+    'Consumer.java',
+    'package com.example;\n' +
+      'import java.util.List;\n' +
+      'import org.springframework.beans.factory.annotation.Autowired;\n' +
+      '\n' +
+      'public class Consumer {\n' +
+      '  @Autowired private List<IFoo> foos;\n' +
+      '}\n',
+  ],
+];
+
 describe('runFullAnalysis — incremental orchestration', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it('first run populates fileHashes + schemaVersion and clears incrementalInProgress on success', async () => {
     const repo = await setupMiniRepo();
     try {
@@ -224,4 +279,159 @@ describe('runFullAnalysis — incremental orchestration', () => {
       await repo.cleanup();
     }
   }, 300_000);
+
+  // Regression for #2289 review P1: a pre-v5 stamp (e.g. v4 with url-only
+  // Route ids) re-analyzed on the SAME commit must NOT early-return on the
+  // `alreadyUpToDate` fast path — otherwise the v5 schema bump's
+  // re-keyed-Route migration is silently bypassed and stale URL-only Route
+  // rows persist alongside any new composite-keyed writes. The schemaVersion
+  // gate (mirrors pdgModeMismatch's slot above the fast path) must force a
+  // full rebuild before lastCommit-equality short-circuits the pipeline.
+  it('a pre-v5 schemaVersion stamp forces a full rebuild on an unchanged-commit re-analyze', async () => {
+    const repo = await setupMiniRepo();
+    try {
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      // First run stamps schemaVersion = INCREMENTAL_SCHEMA_VERSION (v5).
+      await runFullAnalysis(repo.dbPath, { skipAgentsMd: true }, { onProgress: () => {} });
+      const { storagePath } = getStoragePaths(repo.dbPath);
+      const meta = await loadMeta(storagePath);
+      expect(meta).not.toBeNull();
+      expect(meta!.schemaVersion).toBe(INCREMENTAL_SCHEMA_VERSION);
+
+      // Simulate a repo indexed at the SAME commit by a pre-v5 GitNexus
+      // build: rewrite meta.json with schemaVersion = 4. lastCommit and
+      // working tree are untouched, so without the schemaVersion gate the
+      // run-analyze fast path would early-return `alreadyUpToDate=true`
+      // and never touch the stale Route rows.
+      const downgraded: RepoMeta = { ...meta!, schemaVersion: 4 };
+      await saveMeta(storagePath, downgraded);
+
+      const reanalyzed = await runFullAnalysis(
+        repo.dbPath,
+        { skipAgentsMd: true },
+        { onProgress: () => {} },
+      );
+      // Pipeline actually ran (schemaVersion mismatch → force=true).
+      expect(reanalyzed.alreadyUpToDate).toBeUndefined();
+      // And the meta is stamped back to v5 (the rebuild path runs saveMeta).
+      const restamped = await loadMeta(storagePath);
+      expect(restamped!.schemaVersion).toBe(INCREMENTAL_SCHEMA_VERSION);
+    } finally {
+      await repo.cleanup();
+    }
+  }, 300_000);
+
+  // #2331/#2339: mirrors the schemaVersion mismatch test above, but for the
+  // CJK segmentation mode stamp. Uses a non-default mode ('bigram') rather
+  // than 'none' — with the default, (undefined ?? 'none') !== 'none' is
+  // false regardless of whether the stamp was ever actually written, so a
+  // dropped-stamp bug would pass this test vacuously. 'bigram' makes an
+  // omitted stamp manifest as a real comparator mismatch instead.
+  it('a stale cjkSegmentation stamp forces a full rebuild on an unchanged-commit re-analyze', async () => {
+    const repo = await setupMiniRepo();
+    try {
+      vi.stubEnv('GITNEXUS_FTS_CJK_SEGMENTATION', 'bigram');
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      await runFullAnalysis(repo.dbPath, { skipAgentsMd: true }, { onProgress: () => {} });
+      const { storagePath } = getStoragePaths(repo.dbPath);
+      const meta = await loadMeta(storagePath);
+      expect(meta).not.toBeNull();
+      expect(meta!.cjkSegmentation).toBe('bigram');
+
+      // Simulate a repo indexed under 'none' (or a pre-#2339 build with no
+      // stamp at all) that's now being served/re-analyzed with bigram mode.
+      const downgraded: RepoMeta = { ...meta!, cjkSegmentation: 'none' };
+      await saveMeta(storagePath, downgraded);
+
+      const reanalyzed = await runFullAnalysis(
+        repo.dbPath,
+        { skipAgentsMd: true },
+        { onProgress: () => {} },
+      );
+      // Pipeline actually ran (cjkSegmentation mismatch → force=true).
+      expect(reanalyzed.alreadyUpToDate).toBeUndefined();
+      // And the meta is restamped to the live resolved mode.
+      const restamped = await loadMeta(storagePath);
+      expect(restamped!.cjkSegmentation).toBe('bigram');
+    } finally {
+      await repo.cleanup();
+    }
+  }, 300_000);
+
+  it('first-ever analyze of a brand-new repo proceeds without a spurious CJK mode force-rebuild', async () => {
+    const repo = await setupMiniRepo();
+    try {
+      const { storagePath } = getStoragePaths(repo.dbPath);
+      // No meta.json exists yet — existingMeta is falsy, so the
+      // cjkSegmentationModeMismatch guard is skipped entirely (never calls
+      // the comparator), same as the pdg/schemaVersion guards above it.
+      expect(await loadMeta(storagePath)).toBeNull();
+
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+      const result = await runFullAnalysis(
+        repo.dbPath,
+        { skipAgentsMd: true },
+        { onProgress: () => {} },
+      );
+      expect(result.alreadyUpToDate).toBeUndefined();
+
+      const meta = await loadMeta(storagePath);
+      expect(meta!.cjkSegmentation).toBe('none');
+    } finally {
+      await repo.cleanup();
+    }
+  }, 300_000);
+
+  // U7 (#2200): the INJECTS delete-before-writeback must be UNCONDITIONAL.
+  // extractChangedSubgraph re-includes ALL INJECTS edges from the fresh graph
+  // on every incremental run (isGraphWideRelType), and CodeRelation has no PK
+  // and no read-side dedup — so a pdg-gated delete (literal TAINT_PATH
+  // mirroring) would append without deleting on every non-pdg incremental
+  // run: N runs = N copies of every INJECTS row. This test is the assertion
+  // that catches exactly that mistake.
+  it('incremental runs neither strand nor duplicate INJECTS edges (delete-all is not pdg-gated) (#2200)', async () => {
+    const repo = await setupMiniRepo();
+    try {
+      const src = path.join(repo.dbPath, 'src');
+      for (const [name, content] of JAVA_DI_FIXTURE) {
+        await writeFile(path.join(src, name), content, 'utf-8');
+      }
+      gitCommitAll(repo.dbPath, 'add java di fixture');
+
+      const { runFullAnalysis } = await import('../../src/core/run-analyze.js');
+
+      // Full index: Consumer.foos fans out to the two IFoo implementers.
+      await runFullAnalysis(repo.dbPath, { skipAgentsMd: true }, { onProgress: () => {} });
+      expect(await countInjects(repo.dbPath)).toBe(2);
+
+      // Incremental run 1: comment-only touch of an UNRELATED file (none of
+      // the Java DI files change), committed so lastCommit moves.
+      const target = path.join(src, 'logger.ts');
+      const beforeFirstTouch = await readFile(target, 'utf-8');
+      await writeFile(target, beforeFirstTouch + '\n// di idempotency touch 1\n', 'utf-8');
+      gitCommitAll(repo.dbPath, 'unrelated touch 1');
+      const run1 = await runFullAnalysis(
+        repo.dbPath,
+        { skipAgentsMd: true },
+        { onProgress: () => {} },
+      );
+      expect(run1.alreadyUpToDate).toBeUndefined();
+      expect(await countInjects(repo.dbPath)).toBe(2);
+
+      // Incremental run 2: second unrelated touch. A gated delete would have
+      // appended two more rows per writeback (4 by now) — must still be 2.
+      const beforeSecondTouch = await readFile(target, 'utf-8');
+      await writeFile(target, beforeSecondTouch + '\n// di idempotency touch 2\n', 'utf-8');
+      gitCommitAll(repo.dbPath, 'unrelated touch 2');
+      const run2 = await runFullAnalysis(
+        repo.dbPath,
+        { skipAgentsMd: true },
+        { onProgress: () => {} },
+      );
+      expect(run2.alreadyUpToDate).toBeUndefined();
+      expect(await countInjects(repo.dbPath)).toBe(2);
+    } finally {
+      await repo.cleanup();
+    }
+  }, 600_000);
 });

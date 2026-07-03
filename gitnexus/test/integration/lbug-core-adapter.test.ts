@@ -12,6 +12,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'fs/promises';
 import path from 'path';
 import { withTestLbugDB } from '../helpers/test-indexed-db.js';
+import { skipUnlessFtsAvailable } from '../helpers/fts-availability.js';
 
 /**
  * LadybugDB 0.16.0 has a known Windows-only regression: `Database.close()`
@@ -23,25 +24,13 @@ import { withTestLbugDB } from '../helpers/test-indexed-db.js';
  */
 const itLbugReopen = process.platform === 'win32' ? it.skip : it;
 
-/**
- * The FTS extension is optional and defaults to a `load-only` install policy
- * (PR #1161 — offline-first), so on a machine where it was never pre-installed
- * it cannot load. The tests below exercise the FTS *primitives* directly and
- * have nothing to assert without the extension — skip them rather than fail.
- * Graceful degradation when FTS is unavailable is covered at the analyze /
- * query layer (see run-analyze.ts and the BM25 fallback tests).
- */
-const FTS_UNAVAILABLE_NOTE =
-  'FTS extension unavailable (load-only policy; not pre-installed on this machine)';
-
-/**
- * Dynamically skip an FTS-primitive test when the extension cannot load.
- * `ctx.skip()` aborts the test, so callers should `await` this first thing.
- */
-const skipUnlessFtsAvailable = async (ctx: { skip: (note?: string) => void }): Promise<void> => {
-  const { loadFTSExtension } = await import('../../src/core/lbug/lbug-adapter.js');
-  if (!(await loadFTSExtension())) ctx.skip(FTS_UNAVAILABLE_NOTE);
-};
+// The FTS extension is optional and defaults to a `load-only` install policy
+// (PR #1161 — offline-first), so on a machine where it was never pre-installed
+// it cannot load. The tests below exercise the FTS *primitives* directly and
+// have nothing to assert without the extension — skip them rather than fail.
+// Graceful degradation when FTS is unavailable is covered at the analyze /
+// query layer (see run-analyze.ts and the BM25 fallback tests).
+// See test/helpers/fts-availability.ts for skipUnlessFtsAvailable's contract.
 
 // ─── Core LadybugDB Adapter ─────────────────────────────────────────────
 
@@ -137,6 +126,47 @@ withTestLbugDB(
           `MATCH ()-[r:CodeRelation]->() WHERE r.type = 'TAINT_PATH' RETURN count(r) AS cnt`,
         );
         expect(Number((left[0] as { cnt: number }).cnt)).toBe(0);
+      });
+
+      it('deleteAllInjects: removes only INJECTS edges and is benign when none exist (#2200)', async () => {
+        // Mirrors the deleteAllInterprocTaintPaths test above (same contract:
+        // COUNT-then-DELETE, missing-table carve-out, re-throw otherwise).
+        // The re-throw path is not simulated here — doing so would require
+        // breaking the shared singleton connection mid-suite. Its benign-vs-
+        // rethrow classification is pinned as a pure function instead:
+        // `classifyDeleteAllError` (lbug-config.ts), exhaustively covered in
+        // test/unit/lbug-delete-all-error.test.ts.
+        const { executeQuery: coreExecuteQuery, deleteAllInjects } =
+          await import('../../src/core/lbug/lbug-adapter.js');
+
+        // Benign: no INJECTS rows yet → returns 0, does NOT throw.
+        await expect(deleteAllInjects()).resolves.toEqual({ edgesDeleted: 0 });
+
+        // Seed one INJECTS edge plus one edge of ANOTHER type between the two
+        // seeded Function nodes, then delete-all and confirm exactly the
+        // INJECTS row is removed while the other-typed row survives.
+        const fns = (await coreExecuteQuery('MATCH (n:Function) RETURN n.id AS id')) as {
+          id: string;
+        }[];
+        expect(fns.length).toBe(2);
+        await coreExecuteQuery(
+          `MATCH (a:Function {id: '${fns[0].id}'}), (b:Function {id: '${fns[1].id}'}) ` +
+            `CREATE (a)-[:CodeRelation {type: 'INJECTS', confidence: 0.8, reason: 'di', step: 0}]->(b)`,
+        );
+        await coreExecuteQuery(
+          `MATCH (a:Function {id: '${fns[0].id}'}), (b:Function {id: '${fns[1].id}'}) ` +
+            `CREATE (a)-[:CodeRelation {type: 'QUERIES', confidence: 0.8, reason: 'orm', step: 0}]->(b)`,
+        );
+        const r2 = await deleteAllInjects();
+        expect(r2.edgesDeleted).toBe(1);
+        const injectsLeft = await coreExecuteQuery(
+          `MATCH ()-[r:CodeRelation]->() WHERE r.type = 'INJECTS' RETURN count(r) AS cnt`,
+        );
+        expect(Number((injectsLeft[0] as { cnt: number }).cnt)).toBe(0);
+        const queriesLeft = await coreExecuteQuery(
+          `MATCH ()-[r:CodeRelation]->() WHERE r.type = 'QUERIES' RETURN count(r) AS cnt`,
+        );
+        expect(Number((queriesLeft[0] as { cnt: number }).cnt)).toBe(1);
       });
 
       describe('unhappy path', () => {

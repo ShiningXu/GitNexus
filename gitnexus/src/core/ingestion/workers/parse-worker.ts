@@ -30,6 +30,7 @@ import { postResultCloneSafe } from './post-result.js';
 import { mergeResult } from './result-merge.js';
 import type { SymbolTableReader } from '../model/symbol-table.js';
 import type {
+  ExtractedRouterConstructorPrefix,
   ExtractedRouterInclude,
   ExtractedRouterImport,
   ExtractedRouterModuleAlias,
@@ -130,6 +131,7 @@ import {
   persistDurableParsedFileShardSync,
 } from '../../../storage/parsedfile-store.js';
 import { extractLaravelRoutes, type ExtractedRoute } from '../route-extractors/laravel.js';
+import type { SharedSpringType } from '../route-extractors/spring-shared.js';
 import {
   collectFunctionCfgs,
   DEFAULT_PDG_MAX_FUNCTION_LINES,
@@ -399,6 +401,16 @@ export interface ParseWorkerResult {
   decoratorRoutes: ExtractedDecoratorRoute[];
   routerIncludes: ExtractedRouterInclude[];
   routerImports: ExtractedRouterImport[];
+  routerConstructorPrefixes?: ExtractedRouterConstructorPrefix[];
+  /**
+   * Optional. Project-wide `SharedSpringType` view of route-defining
+   * class/interface declarations, produced by the provider's
+   * `extractRouteInheritanceTypes` hook (Java/Spring). parse-impl aggregates
+   * these and runs a cross-file pass that resolves interface-inherited routes
+   * into additional `decoratorRoutes` (#2288). Optional for cache backward
+   * compatibility; consumers must guard with `?? []`.
+   */
+  springTypes?: SharedSpringType[];
   /**
    * Optional. `from <pkg> import <module>` records from Python files
    * where `<module>` is later used as a Shape-A include receiver
@@ -902,6 +914,7 @@ const processBatch = (
     decoratorRoutes: [],
     routerIncludes: [],
     routerImports: [],
+    routerConstructorPrefixes: [],
     routerModuleAliases: [],
     toolDefs: [],
     ormQueries: [],
@@ -1101,6 +1114,25 @@ const ROUTE_DECORATOR_NAMES = new Set([
   'DeleteMapping',
   'PatchMapping',
 ]);
+
+const SPRING_ROUTE_DECORATOR_NAMES = new Set([
+  'RequestMapping',
+  'GetMapping',
+  'PostMapping',
+  'PutMapping',
+  'DeleteMapping',
+  'PatchMapping',
+]);
+
+function isInsideJavaInterface(node: Parser.SyntaxNode): boolean {
+  let cur: Parser.SyntaxNode | null = node.parent;
+  while (cur) {
+    if (cur.type === 'interface_declaration') return true;
+    if (cur.type === 'class_declaration' || cur.type === 'program') return false;
+    cur = cur.parent;
+  }
+  return false;
+}
 
 // ============================================================================
 // ORM Query Detection (Prisma + Supabase)
@@ -1453,7 +1485,9 @@ const processFileGroup = (
           arg: decoratorArg,
         });
 
-        if (ROUTE_DECORATOR_NAMES.has(decoratorName)) {
+        const suppressSpringInterfaceRoute =
+          SPRING_ROUTE_DECORATOR_NAMES.has(decoratorName) && isInsideJavaInterface(decoratorNode);
+        if (ROUTE_DECORATOR_NAMES.has(decoratorName) && !suppressSpringInterfaceRoute) {
           const routePath = decoratorArg || '';
           const method = decoratorName.replace('Mapping', '').toUpperCase();
           const httpMethod = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'].includes(method)
@@ -1691,6 +1725,13 @@ const processFileGroup = (
                         : routedFieldInfo?.type
                           ? { declaredType: routedFieldInfo.type }
                           : {}),
+                      ...(routedFieldInfo?.rawDeclaredType !== undefined
+                        ? { rawDeclaredType: routedFieldInfo.rawDeclaredType }
+                        : {}),
+                      ...(routedFieldInfo?.annotations !== undefined &&
+                      routedFieldInfo.annotations.length > 0
+                        ? { annotations: routedFieldInfo.annotations }
+                        : {}),
                       ...(routedFieldInfo?.visibility !== undefined
                         ? { visibility: routedFieldInfo.visibility }
                         : {}),
@@ -2242,6 +2283,15 @@ const processFileGroup = (
             const info = fieldMap?.get(nodeName);
             if (info) {
               declaredType = info.type ?? undefined;
+              // Mutate methodProps BEFORE the `{...methodProps}` spread below —
+              // rawDeclaredType is the verbatim generic type text (U1, PR #2200).
+              if (info.rawDeclaredType !== undefined) {
+                methodProps.rawDeclaredType = info.rawDeclaredType;
+              }
+              // Field annotations ('@Name' strings, U2 PR #2200) — omit when empty.
+              if (info.annotations !== undefined && info.annotations.length > 0) {
+                methodProps.annotations = info.annotations;
+              }
               methodProps.visibility = info.visibility;
               methodProps.isStatic = info.isStatic;
               methodProps.isReadonly = info.isReadonly;
@@ -2419,6 +2469,7 @@ const processFileGroup = (
         result.routerIncludes,
         result.routerImports,
         (result.routerModuleAliases ??= []),
+        (result.routerConstructorPrefixes ??= []),
       );
     }
 
@@ -2429,6 +2480,14 @@ const processFileGroup = (
     if (provider.extractDecoratorRoutes) {
       const frameworkRoutes = provider.extractDecoratorRoutes(tree, file.path, lineOffset);
       for (const r of frameworkRoutes) result.decoratorRoutes.push(r);
+    }
+
+    // Project-wide route-inheritance type collection via provider hook (#2288).
+    // The per-file SharedSpringType views are aggregated by the parse phase,
+    // which then resolves interface-inherited routes cross-file.
+    if (provider.extractRouteInheritanceTypes) {
+      const springTypes = provider.extractRouteInheritanceTypes(tree, file.path);
+      if (springTypes.length > 0) (result.springTypes ??= []).push(...springTypes);
     }
 
     // Vue: emit CALLS edges for components used in <template>
@@ -2463,6 +2522,7 @@ let accumulated: ParseWorkerResult = {
   decoratorRoutes: [],
   routerIncludes: [],
   routerImports: [],
+  routerConstructorPrefixes: [],
   routerModuleAliases: [],
   toolDefs: [],
   ormQueries: [],
@@ -2603,6 +2663,7 @@ parentPort!.on('message', (msg: WorkerIncomingMessage) => {
         decoratorRoutes: [],
         routerIncludes: [],
         routerImports: [],
+        routerConstructorPrefixes: [],
         routerModuleAliases: [],
         toolDefs: [],
         ormQueries: [],
